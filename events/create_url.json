@@ -1,0 +1,16 @@
+{
+  "resource": "/urls",
+  "path": "/urls",
+  "httpMethod": "POST",
+  "headers": {
+    "Host": "abc123.execute-api.us-east-1.amazonaws.com",
+    "Content-Type": "application/json",
+    "X-Forwarded-Proto": "https"
+  },
+  "requestContext": {
+    "stage": "dev",
+    "identity": { "sourceIp": "203.0.113.10" }
+  },
+  "body": "{\"url\": \"https://example.com/a/very/long/path?with=query\", \"customCode\": \"demo\", \"expiresInDays\": 30, \"owner\": \"user-123\"}",
+  "isBase64Encoded": false
+}

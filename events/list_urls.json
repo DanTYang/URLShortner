@@ -1,0 +1,10 @@
+{
+  "resource": "/urls",
+  "path": "/urls",
+  "httpMethod": "GET",
+  "headers": { "Host": "abc123.execute-api.us-east-1.amazonaws.com" },
+  "queryStringParameters": { "owner": "user-123", "limit": "50" },
+  "requestContext": { "stage": "dev" },
+  "body": null,
+  "isBase64Encoded": false
+}

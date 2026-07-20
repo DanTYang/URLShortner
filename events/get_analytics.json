@@ -1,0 +1,10 @@
+{
+  "resource": "/urls/{shortCode}/analytics",
+  "path": "/urls/demo/analytics",
+  "httpMethod": "GET",
+  "headers": { "Host": "abc123.execute-api.us-east-1.amazonaws.com" },
+  "pathParameters": { "shortCode": "demo" },
+  "requestContext": { "stage": "dev" },
+  "body": null,
+  "isBase64Encoded": false
+}

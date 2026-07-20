@@ -1,0 +1,8 @@
+# The shared layer has no third-party dependencies.
+#
+# boto3 / botocore are provided by the AWS Lambda Python 3.12 runtime, so we
+# deliberately do NOT vendor them here — that keeps the layer tiny and avoids
+# shipping a boto3 version that lags behind the runtime's.
+#
+# This file exists so `sam build` treats the directory as a buildable Python
+# layer. Add real dependencies below if the shared code ever needs them.

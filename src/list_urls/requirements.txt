@@ -1,0 +1,2 @@
+# This function's only imports come from the AWS Lambda Python runtime (boto3)
+# and the shared `urlshortener_common` layer. No third-party packages needed.

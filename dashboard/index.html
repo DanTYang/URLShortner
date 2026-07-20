@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>URL Shortener — Dashboard</title>
+<!--
+  A single-file, dependency-free client for the URL Shortener API.
+
+  It talks to the same REST API the Lambda functions expose:
+     POST /urls                          -> create a short link
+     GET  /urls?owner=...                -> list links
+     GET  /urls/{code}/analytics         -> per-link click analytics
+
+  There is no build step and no framework. Drop this file anywhere (open it
+  locally, or host it on S3 + CloudFront) and paste your API base URL — the
+  same value printed as `ApiBaseUrl` after `sam deploy`.
+
+  The chart is drawn with hand-rolled SVG so the page stays 100% self-contained.
+-->
+<style>
+  :root {
+    --bg: #0f1220; --panel: #191d31; --panel-2: #222741;
+    --text: #e7e9f3; --muted: #9aa0bd; --accent: #6c7bff; --accent-2: #33d6a6;
+    --border: #2b3150; --danger: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.5;
+  }
+  header {
+    padding: 20px 24px; border-bottom: 1px solid var(--border);
+    display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+  }
+  h1 { font-size: 20px; margin: 0; }
+  h1 span { color: var(--accent); }
+  main { max-width: 1000px; margin: 0 auto; padding: 24px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 20px;
+  }
+  .card h2 { margin: 0 0 14px; font-size: 15px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  input {
+    width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--panel-2); color: var(--text); font-size: 14px;
+  }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 160px; }
+  button {
+    margin-top: 14px; padding: 10px 16px; border: 0; border-radius: 8px; cursor: pointer;
+    background: var(--accent); color: white; font-size: 14px; font-weight: 600;
+  }
+  button.secondary { background: var(--panel-2); border: 1px solid var(--border); }
+  button:disabled { opacity: .5; cursor: default; }
+  .result { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; word-break: break-all; }
+  .short-url { color: var(--accent-2); }
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat { background: var(--panel-2); border-radius: 10px; padding: 14px; }
+  .stat .n { font-size: 26px; font-weight: 700; }
+  .stat .l { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  .bar-row { display: flex; align-items: center; gap: 10px; margin: 6px 0; }
+  .bar-label { width: 140px; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-track { flex: 1; background: var(--panel-2); border-radius: 6px; height: 16px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+  .bar-val { width: 44px; text-align: right; font-size: 13px; }
+  .muted { color: var(--muted); }
+  .error { color: var(--danger); font-size: 13px; margin-top: 8px; }
+  .hidden { display: none; }
+  code.pill { background: var(--panel-2); padding: 2px 6px; border-radius: 5px; font-size: 12px; }
+  svg text { fill: var(--muted); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>URL <span>Shortener</span> Dashboard</h1>
+  <div style="min-width:320px;flex:1;max-width:520px">
+    <label for="apiBase">API base URL (from <code class="pill">sam deploy</code> output)</label>
+    <input id="apiBase" placeholder="https://abc123.execute-api.us-east-1.amazonaws.com/dev" />
+  </div>
+</header>
+
+<main>
+  <!-- Create -->
+  <section class="card">
+    <h2>Create a short link</h2>
+    <div class="row">
+      <div style="flex:2">
+        <label for="longUrl">Long URL</label>
+        <input id="longUrl" placeholder="https://example.com/some/very/long/path" />
+      </div>
+      <div>
+        <label for="customCode">Custom code (optional)</label>
+        <input id="customCode" placeholder="spring-sale" />
+      </div>
+      <div>
+        <label for="expiry">Expires in days (optional)</label>
+        <input id="expiry" type="number" min="1" placeholder="30" />
+      </div>
+    </div>
+    <button id="createBtn">Shorten</button>
+    <div id="createResult" class="result" style="margin-top:14px"></div>
+    <div id="createError" class="error"></div>
+  </section>
+
+  <!-- Analytics -->
+  <section class="card">
+    <h2>Link analytics</h2>
+    <div class="row">
+      <div style="flex:2">
+        <label for="analyticsCode">Short code</label>
+        <input id="analyticsCode" placeholder="demo" />
+      </div>
+      <div style="display:flex;align-items:flex-end">
+        <button id="analyticsBtn">Load analytics</button>
+      </div>
+    </div>
+    <div id="analyticsError" class="error"></div>
+
+    <div id="analyticsPanel" class="hidden" style="margin-top:16px">
+      <div class="stat-grid" style="margin-bottom:18px">
+        <div class="stat"><div class="n" id="statTotal">0</div><div class="l">Total clicks</div></div>
+        <div class="stat"><div class="n" id="statCountries">0</div><div class="l">Countries</div></div>
+        <div class="stat"><div class="n" id="statReferrers">0</div><div class="l">Referrers</div></div>
+        <div class="stat"><div class="n" id="statDays">0</div><div class="l">Active days</div></div>
+      </div>
+
+      <h2>Clicks over time</h2>
+      <div id="timeseries" style="overflow-x:auto"></div>
+
+      <div class="row" style="margin-top:18px">
+        <div>
+          <h2>By country</h2>
+          <div id="byCountry"></div>
+        </div>
+        <div>
+          <h2>By referrer</h2>
+          <div id="byReferrer"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- List -->
+  <section class="card">
+    <h2>All links</h2>
+    <div class="row">
+      <div>
+        <label for="listOwner">Filter by owner (optional)</label>
+        <input id="listOwner" placeholder="user-123" />
+      </div>
+      <div style="display:flex;align-items:flex-end">
+        <button id="listBtn" class="secondary">Refresh list</button>
+      </div>
+    </div>
+    <div id="listError" class="error"></div>
+    <div id="listTable" style="margin-top:14px" class="muted">No links loaded yet.</div>
+  </section>
+</main>
+
+<script>
+  // --- tiny helpers --------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  const API = () => $("apiBase").value.replace(/\/+$/, "");
+  // Persist the API base URL locally so you don't retype it every visit.
+  $("apiBase").value = localStorage.getItem("apiBase") || "";
+  $("apiBase").addEventListener("change", () => localStorage.setItem("apiBase", $("apiBase").value));
+
+  async function api(path, options) {
+    if (!API()) throw new Error("Set the API base URL first (top right).");
+    const res = await fetch(API() + path, options);
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch { /* redirect body etc. */ }
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    return data;
+  }
+
+  // --- create --------------------------------------------------------------
+  $("createBtn").addEventListener("click", async () => {
+    $("createError").textContent = "";
+    $("createResult").innerHTML = "";
+    const body = { url: $("longUrl").value.trim() };
+    if ($("customCode").value.trim()) body.customCode = $("customCode").value.trim();
+    if ($("expiry").value) body.expiresInDays = Number($("expiry").value);
+    try {
+      const data = await api("/urls", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      $("createResult").innerHTML =
+        `Short URL: <a class="short-url" href="${data.shortUrl}" target="_blank">${data.shortUrl}</a>` +
+        (data.expiresAt ? `<div class="muted">Expires: ${new Date(data.expiresAt * 1000).toLocaleString()}</div>` : "");
+    } catch (e) {
+      $("createError").textContent = e.message;
+    }
+  });
+
+  // --- analytics -----------------------------------------------------------
+  function barChart(container, obj) {
+    const el = $(container);
+    const entries = Object.entries(obj);
+    if (!entries.length) { el.innerHTML = '<div class="muted">No data yet.</div>'; return; }
+    const max = Math.max(...entries.map(([, v]) => v));
+    el.innerHTML = entries.map(([k, v]) => `
+      <div class="bar-row">
+        <div class="bar-label" title="${k}">${k}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${(v / max) * 100}%"></div></div>
+        <div class="bar-val">${v}</div>
+      </div>`).join("");
+  }
+
+  function lineChart(container, byDay) {
+    const el = $(container);
+    const entries = Object.entries(byDay).sort(([a], [b]) => a.localeCompare(b));
+    if (!entries.length) { el.innerHTML = '<div class="muted">No data yet.</div>'; return; }
+    const W = Math.max(600, entries.length * 60), H = 180, pad = 30;
+    const max = Math.max(...entries.map(([, v]) => v)) || 1;
+    const x = (i) => pad + (i * (W - 2 * pad)) / Math.max(1, entries.length - 1);
+    const y = (v) => H - pad - (v * (H - 2 * pad)) / max;
+    const pts = entries.map(([, v], i) => `${x(i)},${y(v)}`).join(" ");
+    const dots = entries.map(([d, v], i) =>
+      `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" fill="#33d6a6"><title>${d}: ${v}</title></circle>`).join("");
+    const labels = entries.map(([d], i) =>
+      `<text x="${x(i)}" y="${H - 8}" text-anchor="middle">${d.slice(5)}</text>`).join("");
+    el.innerHTML =
+      `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
+        <polyline fill="none" stroke="#6c7bff" stroke-width="2" points="${pts}" />
+        ${dots}${labels}
+        <text x="4" y="${y(max) + 4}">${max}</text>
+        <text x="4" y="${y(0) + 4}">0</text>
+      </svg>`;
+  }
+
+  async function loadAnalytics(code) {
+    $("analyticsError").textContent = "";
+    try {
+      const data = await api(`/urls/${encodeURIComponent(code)}/analytics`);
+      $("analyticsPanel").classList.remove("hidden");
+      $("statTotal").textContent = data.totalClicks;
+      $("statCountries").textContent = Object.keys(data.clicksByCountry || {}).length;
+      $("statReferrers").textContent = Object.keys(data.clicksByReferrer || {}).length;
+      $("statDays").textContent = Object.keys(data.clicksByDay || {}).length;
+      lineChart("timeseries", data.clicksByDay || {});
+      barChart("byCountry", data.clicksByCountry || {});
+      barChart("byReferrer", data.clicksByReferrer || {});
+    } catch (e) {
+      $("analyticsPanel").classList.add("hidden");
+      $("analyticsError").textContent = e.message;
+    }
+  }
+  $("analyticsBtn").addEventListener("click", () => loadAnalytics($("analyticsCode").value.trim()));
+
+  // --- list ----------------------------------------------------------------
+  $("listBtn").addEventListener("click", async () => {
+    $("listError").textContent = "";
+    const owner = $("listOwner").value.trim();
+    try {
+      const data = await api("/urls" + (owner ? `?owner=${encodeURIComponent(owner)}` : ""));
+      if (!data.items.length) { $("listTable").innerHTML = '<div class="muted">No links found.</div>'; return; }
+      $("listTable").innerHTML = `<table>
+        <thead><tr><th>Code</th><th>Destination</th><th>Clicks</th><th>Created</th><th></th></tr></thead>
+        <tbody>${data.items.map(i => `
+          <tr>
+            <td><code class="pill">${i.shortCode}</code></td>
+            <td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${i.longUrl}</td>
+            <td>${i.clickCount}</td>
+            <td class="muted">${(i.createdAt || "").slice(0, 10)}</td>
+            <td><button class="secondary" data-code="${i.shortCode}" style="margin:0;padding:4px 10px">Analytics</button></td>
+          </tr>`).join("")}
+        </tbody></table>`;
+      $("listTable").querySelectorAll("button[data-code]").forEach(b =>
+        b.addEventListener("click", () => {
+          $("analyticsCode").value = b.dataset.code;
+          loadAnalytics(b.dataset.code);
+          document.querySelector("#analyticsPanel").scrollIntoView({ behavior: "smooth" });
+        }));
+    } catch (e) {
+      $("listError").textContent = e.message;
+    }
+  });
+</script>
+</body>
+</html>

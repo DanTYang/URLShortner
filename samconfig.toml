@@ -1,0 +1,46 @@
+# SAM CLI configuration — captures the answers to `sam deploy --guided` so
+# subsequent deploys are a single non-interactive `sam deploy`.
+#
+# Each [<env>.deploy.parameters] block is a named configuration you select
+# with `sam deploy --config-env <env>`. This is what makes "one-command
+# deployment and environment replication" real: the same artifacts deploy to
+# dev / staging / prod by changing one flag.
+
+version = 0.1
+
+# ---------------------------------------------------------------------------
+[default.global.parameters]
+stack_name = "url-shortener-dev"
+
+[default.build.parameters]
+cached = true
+parallel = true
+
+[default.deploy.parameters]
+stack_name = "url-shortener-dev"
+resolve_s3 = true                 # let SAM manage the deployment artifact bucket
+s3_prefix = "url-shortener-dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"   # the stack creates scoped IAM roles
+confirm_changeset = true
+parameter_overrides = "Environment=dev"
+
+# ---------------------------------------------------------------------------
+[staging.deploy.parameters]
+stack_name = "url-shortener-staging"
+resolve_s3 = true
+s3_prefix = "url-shortener-staging"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "Environment=staging"
+
+# ---------------------------------------------------------------------------
+[prod.deploy.parameters]
+stack_name = "url-shortener-prod"
+resolve_s3 = true
+s3_prefix = "url-shortener-prod"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true          # always eyeball the prod changeset
+parameter_overrides = "Environment=prod ClickRetentionDays=365"

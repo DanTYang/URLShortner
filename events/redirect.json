@@ -1,0 +1,18 @@
+{
+  "resource": "/{shortCode}",
+  "path": "/demo",
+  "httpMethod": "GET",
+  "headers": {
+    "Host": "abc123.execute-api.us-east-1.amazonaws.com",
+    "CloudFront-Viewer-Country": "US",
+    "Referer": "https://t.co/abc123",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+  },
+  "pathParameters": { "shortCode": "demo" },
+  "requestContext": {
+    "stage": "dev",
+    "identity": { "sourceIp": "203.0.113.10" }
+  },
+  "body": null,
+  "isBase64Encoded": false
+}

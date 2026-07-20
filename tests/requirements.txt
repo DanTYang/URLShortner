@@ -1,0 +1,4 @@
+# Test-only dependencies. Install with:  pip install -r tests/requirements.txt
+pytest>=8.0
+moto[dynamodb]>=5.0
+boto3>=1.34
