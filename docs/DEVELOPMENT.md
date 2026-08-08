@@ -1,10 +1,9 @@
 # Development Guide
 
-How to work on this codebase locally: run the tests, run the API, understand
-how the shared layer is wired, and add new functionality.
+How to work on this codebase locally: run the API, understand how the shared
+layer is wired, and add new functionality.
 
 - [Setup](#setup)
-- [Running the tests](#running-the-tests)
 - [How imports work (the shared layer)](#how-imports-work-the-shared-layer)
 - [Running the API locally](#running-the-api-locally)
 - [Invoking a single function with a sample event](#invoking-a-single-function)
@@ -18,37 +17,11 @@ how the shared layer is wired, and add new functionality.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r tests/requirements.txt
 ```
 
-That's all you need for the tests (they mock AWS). For deploying and running
-the API locally you also need the AWS SAM CLI and Docker — see
-[`DEPLOYMENT.md`](DEPLOYMENT.md#prerequisites).
-
----
-
-## Running the tests
-
-```bash
-make test          # or: pytest
-```
-
-The suite (in `tests/`) exercises the **real handler code** against a **mocked
-DynamoDB** via [`moto`](https://github.com/getmoto/moto). No AWS account, no
-network, no Docker. What's covered:
-
-| File | Covers |
-|---|---|
-| `test_shortcode.py` | Base62 generation, custom-code validation, collision retry & keyspace growth. |
-| `test_create_url.py` | Create happy path, custom codes, 409 collisions, validation, expiry persistence. |
-| `test_redirect.py` | Redirects, 404/410, click recording, counter increments, best-effort analytics. |
-| `test_analytics.py` | Analytics aggregation by facet, the list endpoint (scan + GSI paths). |
-
-`tests/conftest.py` is where the magic lives:
-- it sets the environment variables the code reads at import time,
-- creates mocked DynamoDB tables that mirror `template.yaml`,
-- re-points the application's cached table handles at the mocks, and
-- provides `load_handler(name)` and `api_event(**kwargs)` helpers.
+The functions have no third-party dependencies — `boto3` ships with the Lambda
+runtime. For deploying and running the API locally you need the AWS SAM CLI and
+Docker; see [`DEPLOYMENT.md`](DEPLOYMENT.md#prerequisites).
 
 ---
 
@@ -62,9 +35,8 @@ from urlshortener_common import dynamo, metrics, responses
 ```
 
 The directory `layers/common/python/urlshortener_common/` is laid out to match
-that runtime path exactly. Locally, `tests/conftest.py` adds
-`layers/common/python` to `sys.path` so the same import works under pytest with
-no packaging step.
+that runtime path exactly, so the same import works locally by adding
+`layers/common/python` to `sys.path` — no packaging step required.
 
 Each function's entry module is `app.py` with a `handler(event, context)`
 function — that's what `template.yaml` points `Handler: app.handler` at. Because
@@ -92,8 +64,7 @@ curl -si http://127.0.0.1:3000/demo | head -3
 > `sam local` still talks to **real DynamoDB** by default (it only emulates
 > Lambda + API Gateway). Point the functions at a local DynamoDB by setting the
 > table env vars and running [DynamoDB Local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html),
-> or just deploy a `dev` stack and test against that. For fast iteration on
-> business logic, the mocked pytest suite is the quickest loop.
+> or deploy a `dev` stack and work against that.
 
 ---
 
@@ -135,9 +106,7 @@ Say you want `DELETE /urls/{shortCode}`:
 3. **Register it in `template.yaml`** — a new `AWS::Serverless::Function` with a
    `DynamoDBCrudPolicy` and an `Api` event for `Path: /urls/{shortCode}`,
    `Method: delete`.
-4. **Test it** — add `tests/test_delete_url.py` using the `aws` fixture and
-   `load_handler("delete_url")`.
-5. **Document it** — add a section to [`API.md`](API.md).
+4. **Document it** — add a section to [`API.md`](API.md).
 
 `sam build && sam deploy` ships it.
 

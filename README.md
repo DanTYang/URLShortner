@@ -1,192 +1,158 @@
 # Serverless URL Shortener
 
-A scalable URL shortening service built entirely on AWS serverless primitives:
-**AWS Lambda**, **API Gateway**, and **DynamoDB**, deployed as
-infrastructure‑as‑code with **AWS SAM**. It generates custom short codes with
-collision detection, supports optional link expiration, and tracks click
-analytics (counts, geography, referrers) which are surfaced through
-**CloudWatch** metrics, a CloudWatch dashboard, and a small browser dashboard.
+A production-shaped URL shortening service on AWS Lambda, API Gateway and
+DynamoDB, defined end to end as infrastructure-as-code with AWS SAM.
 
-> **New to the project or coming back after a while?** Start with
-> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the "how it all fits
-> together" picture, then use this README as the quick reference.
+Custom short codes with race-free collision detection, optional link expiry,
+and per-link click analytics (counts, geography, referrers) surfaced through
+CloudWatch metrics and a dependency-free browser dashboard.
 
 ---
 
-## What it does
-
-| Capability | How it works |
-|---|---|
-| **Shorten a URL** | `POST /urls` stores a `shortCode → longUrl` mapping in DynamoDB and returns a short link. |
-| **Custom codes** | Supply `customCode` (e.g. `spring-sale`); validated and claimed atomically. |
-| **Collision detection** | Short codes are claimed with a DynamoDB *conditional write*, so two URLs can never share a code even under concurrent traffic. |
-| **Expiring links** | Supply `expiresInDays`; the link 410s after it lapses and is auto‑deleted by DynamoDB TTL. |
-| **Redirect** | `GET /{shortCode}` resolves the code and issues a cacheable `301` redirect. |
-| **Analytics** | Every redirect records a click event (country, referrer, timestamp) and emits CloudWatch metrics. |
-| **Dashboards** | A CloudWatch dashboard shows live traffic/latency/geography; a bundled HTML page shows per‑link analytics. |
-| **One‑command deploy** | `sam build && sam deploy` provisions the entire stack; repeat with a different `--config-env` to replicate environments. |
-
----
-
-## Architecture at a glance
+## Architecture
 
 ```
                     ┌─────────────────────────────────────────────┐
    Client / browser │                 API Gateway                 │
-   ───────────────► │  POST /urls   GET /{code}   GET /urls/...    │
+   ───────────────► │  POST /urls   GET /{code}   GET /urls/...   │
                     └───────┬───────────┬──────────────┬──────────┘
                             │           │              │
-                   ┌────────▼──┐  ┌─────▼──────┐  ┌────▼─────────┐
-                   │ CreateUrl │  │  Redirect  │  │ GetAnalytics │   AWS Lambda
-                   │  λ        │  │   λ        │  │  / ListUrls λ │  (Python 3.12)
-                   └────┬──────┘  └──┬─────┬───┘  └──────┬───────┘
+                   ┌────────▼──┐  ┌─────▼──────┐  ┌────▼──────────┐
+                   │ CreateUrl │  │  Redirect  │  │ GetAnalytics  │  AWS Lambda
+                   │     λ     │  │     λ      │  │  / ListUrls λ │  (Python 3.12,
+                   └────┬──────┘  └──┬─────┬───┘  └──────┬────────┘   arm64)
                         │            │     │             │
              conditional│      get   │     │ record      │ query
-                   put   │      item │     │ click       │
+                    put │      item  │     │ click       │
                         ▼            ▼     ▼             ▼
                  ┌──────────────────────┐  ┌──────────────────────┐
-                 │  DynamoDB: Urls      │  │  DynamoDB: Clicks     │
-                 │  (shortCode → url)   │  │  (per‑click events)   │
+                 │  DynamoDB: Urls      │  │  DynamoDB: Clicks    │
+                 │  (shortCode → url)   │  │  (per-click events)  │
                  └──────────────────────┘  └──────────────────────┘
                         │                          │
                         └──────── EMF metrics ─────┴────────► CloudWatch
-                                                              (metrics + dashboard)
 ```
 
-Full details, data model, and design trade‑offs live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+| Method & path | Purpose |
+|---|---|
+| `POST /urls` | Create a short link — auto or custom code, optional expiry |
+| `GET /{shortCode}` | Resolve, record a click, `301` to the target |
+| `GET /urls/{shortCode}/analytics` | Click totals and breakdowns for one link |
+| `GET /urls` | List links, optionally filtered by owner |
+
+Full details in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+---
+
+## Design decisions worth reading
+
+**Collision detection belongs to the database.** The naive approach — check
+whether a code exists, then write it — is a read-then-write race that no amount
+of application code fixes. Every claim here is a single conditional write:
+
+```python
+table.put_item(Item=item, ConditionExpression="attribute_not_exists(shortCode)")
+```
+
+DynamoDB evaluates that atomically, so exactly one writer wins under any
+concurrency and the loser simply retries with a fresh candidate. Uniqueness
+becomes a property of the storage engine rather than something the application
+has to coordinate. The same reasoning drives the atomic `UpdateExpression` used
+for click counts.
+
+**Codes come from a CSPRNG, not a counter.** Sequential IDs are dense and
+enumerable. Since a short link is a bearer token — knowing the code is enough to
+follow it — codes are drawn from `secrets` over a 62-symbol alphabet.
+
+**Metrics ride the log stream.** Calling `PutMetricData` on the redirect path
+would add a network round trip to every request. Instead the functions emit
+CloudWatch Embedded Metric Format documents to stdout, which Lambda already
+ships; CloudWatch parses them into real metrics asynchronously. Zero added
+request latency.
+
+**Analytics is best-effort, deliberately.** Resolving the link is the user's
+goal; recording the click is ours. The click write is wrapped so a failure
+loses the event rather than the redirect — an explicit decision about which
+failure is worse, documented at the call site.
+
+**Two-tier click accounting.** The lifetime total is an atomic counter on the
+URL row and lives forever; the detailed breakdowns come from raw click events
+that TTL out after 90 days. Long-term totals without paying to store every raw
+event forever.
+
+**Least privilege in IAM.** The two read-only functions get
+`DynamoDBReadPolicy` rather than `Crud`, and the list function has no access to
+the clicks table at all — so a bug in one bounds its own blast radius.
+
+---
+
+## Deploying
+
+```bash
+sam validate --lint
+sam build
+sam deploy --guided          # first run; answers are saved to samconfig.toml
+```
+
+The stack prints an `ApiBaseUrl` on completion:
+
+```bash
+API=https://xxxx.execute-api.us-east-1.amazonaws.com/dev
+
+curl -s -X POST "$API/urls" -H 'Content-Type: application/json' \
+  -d '{"url":"https://aws.amazon.com/lambda/","customCode":"lambda"}'
+
+curl -si "$API/lambda" | head -3          # 301 + Location
+curl -s "$API/urls/lambda/analytics"      # the click, recorded
+```
+
+`samconfig.toml` holds named `dev` / `staging` / `prod` configurations, so
+replicating an environment is `sam deploy --config-env staging`.
+
+Tear down with `make delete`. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
 ---
 
 ## Repository layout
 
 ```
-.
-├── template.yaml            # SAM/CloudFormation — the entire infrastructure
-├── samconfig.toml           # Per-environment deploy settings (dev/staging/prod)
-├── Makefile                 # `make test`, `make deploy`, ... convenience targets
-│
-├── src/                     # One folder = one Lambda function
-│   ├── create_url/app.py    #   POST /urls
-│   ├── redirect/app.py      #   GET  /{shortCode}
-│   ├── get_analytics/app.py #   GET  /urls/{shortCode}/analytics
-│   └── list_urls/app.py     #   GET  /urls
-│
-├── layers/common/           # Shared code, deployed as a Lambda layer
-│   └── python/urlshortener_common/
-│       ├── config.py        #   env-driven configuration
-│       ├── shortcode.py     #   base62 generation + collision retry
-│       ├── dynamo.py        #   DynamoDB access layer
-│       ├── metrics.py       #   CloudWatch metrics (EMF)
-│       ├── geo.py           #   country / referrer extraction
-│       └── responses.py     #   API Gateway response helpers
-│
-├── dashboard/index.html     # Self-contained browser analytics dashboard
-├── events/                  # Sample API Gateway events for local testing
-├── tests/                   # pytest suite (mocked AWS via moto)
-└── docs/                    # Extended documentation (start here!)
-    ├── ARCHITECTURE.md
-    ├── API.md
-    ├── DEPLOYMENT.md
-    ├── ANALYTICS.md
-    └── DEVELOPMENT.md
+template.yaml            # the entire infrastructure, one file
+samconfig.toml           # per-environment deploy settings
+src/                     # one directory per Lambda
+  create_url/  redirect/  get_analytics/  list_urls/
+layers/common/           # shared code, deployed as a Lambda layer
+  python/urlshortener_common/
+    config.py  shortcode.py  dynamo.py  metrics.py  geo.py  responses.py
+dashboard/index.html     # dependency-free browser client
+events/                  # sample API Gateway events for local invocation
+docs/                    # architecture, API reference, deployment, analytics
 ```
 
 ---
 
-## Quick start
+## Known limitations
 
-### 1. Prerequisites
-- An AWS account and credentials (`aws configure`)
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- Python 3.12 and Docker (Docker only needed for `sam local`)
+Deliberate scope choices, not oversights. Each is something I would address
+before this served real traffic:
 
-### 2. Deploy everything (one command, first time is guided)
-```bash
-sam build
-sam deploy --guided        # answer the prompts once; saved to samconfig.toml
-```
-When it finishes, SAM prints the outputs — grab **`ApiBaseUrl`**:
-```
-Key                 ApiBaseUrl
-Value               https://abc123.execute-api.us-east-1.amazonaws.com/dev
-```
-
-### 3. Create and use a short link
-```bash
-API=https://abc123.execute-api.us-east-1.amazonaws.com/dev
-
-# Create
-curl -s -X POST "$API/urls" \
-  -H 'Content-Type: application/json' \
-  -d '{"url": "https://aws.amazon.com/lambda/", "customCode": "lambda"}'
-# → { "shortUrl": "https://.../dev/lambda", ... }
-
-# Follow the short link (‑L follows the 301 redirect)
-curl -sL "$API/lambda" -o /dev/null -w '%{http_code}\n'
-
-# See analytics
-curl -s "$API/urls/lambda/analytics" | jq
-```
-
-### 4. Open the dashboards
-- **CloudWatch dashboard** — URL is in the stack outputs (`DashboardUrl`).
-- **Browser dashboard** — open `dashboard/index.html`, paste your `ApiBaseUrl`.
-
-Full API reference: [`docs/API.md`](docs/API.md).
-Full deployment guide (multi‑env, teardown, CI): [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
-
----
-
-## Local development & testing
-
-The test suite runs entirely offline — AWS is mocked with
-[`moto`](https://github.com/getmoto/moto), so no account or network is needed.
-
-```bash
-make install     # pip install -r tests/requirements.txt
-make test        # run the pytest suite
-make validate    # lint the SAM template (needs sam or cfn-lint)
-make local       # run the API locally on :3000 (needs Docker)
-```
-
-See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) for the full local workflow,
-how the shared layer is wired for imports, and how to add a new endpoint.
-
----
-
-## Configuration
-
-Everything tunable is a CloudFormation parameter (in `template.yaml`), so the
-same code deploys unchanged across environments:
-
-| Parameter | Default | Meaning |
-|---|---|---|
-| `Environment` | `dev` | Namespaces every resource and the metrics namespace. |
-| `ShortCodeLength` | `7` | Base62 characters per auto‑generated code (62⁷ ≈ 3.5 trillion). |
-| `ClickRetentionDays` | `90` | How long raw click events live before TTL cleanup. |
-| `MaxCollisionRetries` | `5` | Collision retries before returning an error. |
-
-Override at deploy time, e.g.:
-```bash
-sam deploy --config-env prod \
-  --parameter-overrides Environment=prod ShortCodeLength=8 ClickRetentionDays=365
-```
-
----
-
-## Cost & scaling notes
-
-- **DynamoDB** uses on‑demand (`PAY_PER_REQUEST`) billing — no capacity to
-  provision; it scales with traffic and costs nothing when idle.
-- **Lambda + API Gateway** are pay‑per‑request with generous free tiers.
-- **Redirects are cached** (`Cache-Control` + `301`), so repeat traffic to a
-  popular link is largely served by browsers/CDNs, not Lambda.
-- The redirect path is a single‑digit‑millisecond `GetItem` keyed on
-  `shortCode`, so it scales horizontally without hot partitions.
-
-For a back‑of‑the‑envelope cost model and the scaling ceiling of each
-component, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#cost--scaling).
+- **No authentication.** The redirect endpoint is correctly public — that is
+  the product. The other three are not, and `owner` is a client-supplied string,
+  so it groups links rather than protecting them. Minimum fix is API Gateway
+  API keys; the right fix is a Cognito authorizer with the owner read from the
+  verified token rather than the request body.
+- **Click recording is synchronous**, tripling DynamoDB operations on the
+  busiest endpoint. Off the request path via DynamoDB Streams or SQS at volume.
+- **Analytics aggregates up to 5,000 events per request**, and reports
+  `truncated` when it hits that bound. Precomputed daily rollups are the real
+  answer.
+- **Geography depends on CloudFront** for the `CloudFront-Viewer-Country`
+  header. Behind a bare API Gateway URL it degrades to `UNKNOWN`.
+- **Cached 301s outlive short expiries.** A one-hour link stays in a browser
+  cache for the full `max-age`. Capping `max-age` at the remaining TTL, or
+  serving `302` for expiring links, resolves it.
+- **No malicious-URL screening.** The failure that actually kills a shortener
+  is the domain landing on a phishing blocklist, which breaks every link ever
+  issued. A Safe Browsing check at creation is the highest-value addition here.
 
 ---
 

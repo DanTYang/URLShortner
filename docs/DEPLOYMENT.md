@@ -165,8 +165,6 @@ provider's OIDC role:
 ```yaml
 # sketch — adapt to your CI system
 steps:
-  - run: pip install -r tests/requirements.txt
-  - run: pytest                       # fail fast on logic regressions
   - run: sam build
   - run: sam deploy --config-env staging --no-confirm-changeset
   # ... promote to prod on approval:

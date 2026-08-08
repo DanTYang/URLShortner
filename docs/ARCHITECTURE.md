@@ -7,7 +7,6 @@ top-to-bottom the first time; after that use it as a reference.
 - [The big picture](#the-big-picture)
 - [Request flows](#request-flows)
 - [Data model](#data-model)
-- [How the four resume claims map to code](#how-the-four-resume-claims-map-to-code)
 - [Key design decisions](#key-design-decisions)
 - [Cost & scaling](#cost--scaling)
 - [Security posture](#security-posture)
@@ -126,49 +125,6 @@ high-volume, append-only, and disposable after the retention window. Splitting
 them keeps the hot redirect path's table small and lets clicks expire without
 touching link metadata. The permanent `clickCount` counter lives on the
 `Urls` row so totals survive even after individual click events are TTL'd away.
-
----
-
-## How the four resume claims map to code
-
-This project was rebuilt from these four bullet points. Here's exactly where
-each one lives:
-
-> **① Built a scalable URL shortening service using AWS Lambda, API Gateway, and DynamoDB**
-
-- `template.yaml` provisions the Lambda functions, the API Gateway REST API,
-  and the two DynamoDB tables.
-- Scalability comes from: on-demand DynamoDB, stateless Lambda (scales
-  per-request), single-key redirect lookups (no hot partitions), and cacheable
-  301s that offload repeat traffic. See [Cost & scaling](#cost--scaling).
-
-> **② Implemented custom short code generation with collision detection and optional expiration dates**
-
-- Generation & retry: `layers/common/python/urlshortener_common/shortcode.py`.
-- Collision detection: the conditional `PutItem` in `dynamo.put_url`.
-- Custom codes: validated in `shortcode.is_valid_custom_code`, claimed in
-  `create_url/app.py`.
-- Expiration: `expiresInDays` → absolute `expiresAt` (exact check in
-  `dynamo.is_expired`, enforced by `redirect/app.py`) **and** `ttl` (DynamoDB
-  background cleanup).
-
-> **③ Created analytics dashboard tracking click counts, geographic data, and referrer sources using CloudWatch metrics**
-
-- Click capture: `redirect/app.py` → `dynamo.record_click`.
-- Geography & referrer extraction: `geo.py` (from the `CloudFront-Viewer-Country`
-  and `Referer` headers).
-- CloudWatch metrics: `metrics.py` emits `Redirects`, `ClicksByCountry`,
-  `ClicksByReferrer`, etc. via the Embedded Metric Format.
-- Dashboards: the CloudWatch `OperationsDashboard` in `template.yaml`, plus the
-  per-link browser dashboard in `dashboard/index.html` (backed by
-  `get_analytics/app.py`). See [`ANALYTICS.md`](ANALYTICS.md).
-
-> **④ Deployed infrastructure as code using AWS SAM, enabling one-command deployment and environment replication**
-
-- `template.yaml` is the single SAM definition of the whole stack.
-- `samconfig.toml` holds named `dev` / `staging` / `prod` configurations.
-- `sam build && sam deploy --config-env <env>` deploys/replicates an entire
-  environment in one command. See [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ---
 
