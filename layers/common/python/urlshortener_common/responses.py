@@ -6,7 +6,6 @@ here keeps the handlers terse and the JSON/CORS handling consistent.
 """
 
 import json
-from typing import Any
 
 _JSON_HEADERS = {
     "Content-Type": "application/json",
@@ -17,7 +16,25 @@ _JSON_HEADERS = {
 }
 
 
-def json_response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
+def to_int(value):
+    """Coerce a DynamoDB number to a plain ``int``, passing ``None`` through.
+
+    DynamoDB returns every number as ``decimal.Decimal``, which ``json.dumps``
+    refuses to serialise. :func:`json_response` passes ``default=str`` so that
+    never raises -- but the cost is that an unconverted number is published as
+    a JSON *string* instead of a number.
+
+    That is how the same field ends up as ``1788725445`` from one endpoint and
+    ``"1788725445"`` from another: whichever handler happened to hold a real
+    Python int got a number, and the ones reading straight from DynamoDB got
+    text. Any client doing arithmetic on it breaks on half your API.
+
+    Use this on every numeric value that comes out of a table row.
+    """
+    return None if value is None else int(value)
+
+
+def json_response(status_code, body):
     """Build a JSON API response."""
     return {
         "statusCode": status_code,
@@ -26,14 +43,14 @@ def json_response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def error(status_code: int, message: str, **extra: Any) -> dict[str, Any]:
+def error(status_code, message, **extra):
     """Build a JSON error response of the form ``{"error": "..."}``."""
     payload = {"error": message}
     payload.update(extra)
     return json_response(status_code, payload)
 
 
-def redirect(location: str, *, status_code: int = 301) -> dict[str, Any]:
+def redirect(location, *, status_code = 301):
     """Build an HTTP redirect response.
 
     Defaults to 301 (permanent) so browsers and crawlers cache the mapping,
@@ -49,7 +66,7 @@ def redirect(location: str, *, status_code: int = 301) -> dict[str, Any]:
     }
 
 
-def parse_json_body(event: dict[str, Any]) -> dict[str, Any]:
+def parse_json_body(event):
     """Parse a JSON request body, returning ``{}`` when absent/blank.
 
     Raises

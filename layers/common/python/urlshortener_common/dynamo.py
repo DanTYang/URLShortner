@@ -1,20 +1,25 @@
 """DynamoDB access layer.
 
-All reads and writes to the two tables funnel through this module so that the
-handlers stay focused on HTTP concerns and the storage details (key shapes,
-conditional writes, TTL maths) live in one place.
+All reads and writes funnel through this module, so handlers stay focused on
+HTTP and the storage details — key shapes, conditional writes, TTL maths — live
+in one place.
 
 Table shapes
 ------------
-UrlsTable   PK ``shortCode``            — one row per short link.
+UrlsTable   PK ``shortCode``. One row per short link.
             GSI ``owner-createdAt-index`` for "list my links, newest first".
-ClicksTable PK ``shortCode`` / SK ``clickId`` — one row per click event.
+ClicksTable PK ``shortCode`` / SK ``clickId``. One row per click event.
+
+The table handles below are created at module scope on purpose. Lambda reuses a
+warm container across invocations, so module-level work runs once and is then
+free for every subsequent request; building the client inside the handler would
+pay that cost on every redirect. (The trade-off is that anything wanting to
+substitute these handles has to rebind the module globals.)
 """
 
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
 
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -22,48 +27,38 @@ from botocore.exceptions import ClientError
 
 from . import config
 
-# Reuse a single resource across warm invocations. Creating the client is the
-# expensive part, so hoisting it out of the handler cuts cold-start-adjacent
-# latency on every subsequent call.
 _dynamodb = boto3.resource("dynamodb")
 _urls_table = _dynamodb.Table(config.URLS_TABLE)
 _clicks_table = _dynamodb.Table(config.CLICKS_TABLE)
 
 
-def _now() -> datetime:
+def _now():
+    """Timezone-aware current UTC time. Always store UTC; never ``utcnow()``."""
     return datetime.now(timezone.utc)
 
 
-def iso_now() -> str:
-    """Current time as an ISO-8601 UTC string (sortable, human readable)."""
+def iso_now():
+    """Current time as an ISO-8601 UTC string — sortable and human-readable."""
     return _now().isoformat()
 
 
 # ---------------------------------------------------------------------------
 # URL rows
 # ---------------------------------------------------------------------------
-def put_url(
-    short_code: str,
-    long_url: str,
-    *,
-    owner: str = "anonymous",
-    expires_at: Optional[int] = None,
-    custom: bool = False,
-) -> bool:
+def put_url(short_code, long_url, *, owner="anonymous", expires_at=None, custom=False):
     """Atomically create a URL row, failing if the code is already taken.
 
-    The ``ConditionExpression`` is the entire collision-detection mechanism:
-    DynamoDB guarantees the write is rejected if a row with the same
-    ``shortCode`` already exists, even under concurrent writers. That makes
-    short-code uniqueness a property of the database, not a check-then-write
-    race in application code.
+    The ``ConditionExpression`` is the entire collision-detection mechanism.
+    DynamoDB evaluates it atomically at the storage node, so exactly one writer
+    wins under any amount of concurrency. Uniqueness becomes a property of the
+    database rather than a check-then-write race in application code.
 
     Returns
     -------
-    ``True``  if the row was created.
-    ``False`` if the code already existed (collision) — the caller retries.
+    True if the row was created, False if the code already existed — in which
+    case the caller retries with a fresh candidate.
     """
-    item: dict[str, Any] = {
+    url_row = {
         "shortCode": short_code,
         "longUrl": long_url,
         "owner": owner,
@@ -72,31 +67,42 @@ def put_url(
         "custom": custom,
     }
     if expires_at is not None:
-        # Stored twice: ``expiresAt`` for our own exact expiry check on read,
-        # and ``ttl`` for DynamoDB's automatic (eventual) background deletion.
-        item["expiresAt"] = expires_at
-        item["ttl"] = expires_at
+        # Stored twice, two jobs: `expiresAt` drives the exact check on read,
+        # `ttl` drives DynamoDB's background deletion. TTL alone is eventual
+        # (AWS documents up to 48 hours), so a lapsed link would keep resolving.
+        url_row["expiresAt"] = expires_at
+        url_row["ttl"] = expires_at
 
     try:
         _urls_table.put_item(
-            Item=item,
+            Item=url_row,
             ConditionExpression="attribute_not_exists(shortCode)",
         )
         return True
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return False  # collision — caller should retry with a new code
+            return False
+        # Any other error is a real failure. Returning False here would send
+        # the caller into a pointless retry loop against a broken database.
         raise
 
 
-def get_url(short_code: str) -> Optional[dict[str, Any]]:
-    """Fetch a URL row by code, or ``None`` if it does not exist."""
-    resp = _urls_table.get_item(Key={"shortCode": short_code})
-    return resp.get("Item")
+def get_url(short_code):
+    """Fetch a URL row by code, or None if it does not exist.
+
+    A miss is an absent ``Item`` key, not an exception.
+    """
+    return _urls_table.get_item(Key={"shortCode": short_code}).get("Item")
 
 
-def increment_click_count(short_code: str) -> int:
-    """Atomically bump the cached click counter and return the new value."""
+def increment_click_count(short_code):
+    """Atomically bump the cached click counter and return the new value.
+
+    Read-modify-write in Python would lose clicks: two concurrent requests both
+    read 5 and both write 6. An update expression is evaluated at the storage
+    node under a per-item lock, and ``ReturnValues`` hands back *this* caller's
+    result rather than whatever the counter reads a moment later.
+    """
     resp = _urls_table.update_item(
         Key={"shortCode": short_code},
         UpdateExpression="SET clickCount = if_not_exists(clickCount, :zero) + :one",
@@ -106,16 +112,13 @@ def increment_click_count(short_code: str) -> int:
     return int(resp["Attributes"]["clickCount"])
 
 
-def list_urls(
-    owner: Optional[str] = None,
-    *,
-    limit: int = 50,
-) -> list[dict[str, Any]]:
-    """List URL rows.
+def list_urls(owner=None, *, limit=50):
+    """List URL rows, optionally filtered to one owner.
 
-    With an ``owner`` this queries the GSI (efficient, sorted newest-first).
-    Without one it falls back to a bounded scan — fine for a demo/admin view
-    but explicitly capped so it can never run away on a large table.
+    With an owner this queries the GSI and reads only that owner's partition,
+    so cost scales with their link count. Without one it falls back to a
+    bounded scan, whose cost scales with the size of the entire table — fine
+    for an admin view behind a hard cap, wrong for a hot path.
     """
     if owner:
         resp = _urls_table.query(
@@ -124,69 +127,70 @@ def list_urls(
             ScanIndexForward=False,  # newest first
             Limit=limit,
         )
-        return resp.get("Items", [])
-
-    resp = _urls_table.scan(Limit=limit)
+    else:
+        resp = _urls_table.scan(Limit=limit)
     return resp.get("Items", [])
 
 
-def is_expired(url_row: dict[str, Any], *, now: Optional[int] = None) -> bool:
-    """True if the link has an ``expiresAt`` in the past.
+def is_expired(url_row, *, now=None):
+    """True if the link carries an ``expiresAt`` in the past.
 
-    DynamoDB TTL deletion is only eventual (it can lag by up to ~48h), so we
-    also enforce expiry here on read to guarantee an expired link stops
-    resolving immediately.
+    ``now`` is injectable so tests can simulate the future without sleeping.
+    Compared with ``is None`` rather than truthiness, because epoch 0 is a
+    legitimate instant.
     """
     expires_at = url_row.get("expiresAt")
     if expires_at is None:
         return False
-    current = now if now is not None else int(time.time())
-    return int(expires_at) <= current
+    now = int(time.time()) if now is None else now
+    return expires_at <= now
 
 
 # ---------------------------------------------------------------------------
 # Click events
 # ---------------------------------------------------------------------------
 def record_click(
-    short_code: str,
-    *,
-    country: str = "UNKNOWN",
-    referrer: str = "direct",
-    user_agent: str = "",
-    timestamp: Optional[datetime] = None,
-) -> dict[str, Any]:
+    short_code, *, country="UNKNOWN", referrer="direct", user_agent="", timestamp=None
+):
     """Write one click event to the analytics table.
 
-    The sort key ``clickId`` is ``<iso-timestamp>#<uuid>`` so events sort
-    chronologically and never collide even within the same millisecond. Each
-    row carries its own ``ttl`` so old raw events are purged automatically
-    after ``CLICK_RETENTION_DAYS``.
+    Three deliberate choices:
+
+    * ``clickId`` is ``<iso-timestamp>#<uuid8>``. The timestamp makes the sort
+      key chronological, so "most recent clicks" is a range read rather than a
+      sort; the random suffix stops two clicks in the same microsecond from
+      sharing a key and overwriting each other.
+    * ``date`` is denormalised from ``timestamp`` so the daily series is a
+      group-by rather than a parse of every row.
+    * ``userAgent`` is truncated. Never store an unbounded attacker-supplied
+      string in an item capped at 400 KB and billed by the byte.
     """
     ts = timestamp or _now()
-    click_id = f"{ts.isoformat()}#{uuid.uuid4().hex[:8]}"
-    ttl = int(ts.timestamp()) + config.CLICK_RETENTION_DAYS * 86400
-
-    item = {
+    click = {
         "shortCode": short_code,
-        "clickId": click_id,
+        "clickId": f"{ts.isoformat()}#{uuid.uuid4().hex[:8]}",
         "timestamp": ts.isoformat(),
         "date": ts.strftime("%Y-%m-%d"),
         "country": country,
         "referrer": referrer,
-        "userAgent": user_agent[:512],  # cap to avoid unbounded rows
-        "ttl": ttl,
+        "userAgent": user_agent[:512],
+        "ttl": int(ts.timestamp()) + config.CLICK_RETENTION_DAYS * 86400,
     }
-    _clicks_table.put_item(Item=item)
-    return item
+    _clicks_table.put_item(Item=click)
+    return click
 
 
-def query_clicks(
-    short_code: str,
-    *,
-    limit: int = 1000,
-) -> Iterable[dict[str, Any]]:
-    """Yield click events for a link, paginating transparently."""
-    kwargs: dict[str, Any] = {
+def query_clicks(short_code, *, limit=1000):
+    """Yield click events for a link, newest first, paginating transparently.
+
+    DynamoDB caps a single Query at 1 MB and returns a ``LastEvaluatedKey``
+    bookmark when there is more. Callers should not have to know that, so it is
+    hidden here.
+
+    This is a generator: a caller that stops early never triggers the next
+    page, and the full result set never has to fit in memory.
+    """
+    kwargs = {
         "KeyConditionExpression": Key("shortCode").eq(short_code),
         "ScanIndexForward": False,  # newest first
     }

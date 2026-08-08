@@ -9,7 +9,7 @@ unchanged across dev / staging / prod stacks.
 import os
 
 
-def _int_env(name: str, default: int) -> int:
+def _int_env(name, default):
     """Read an integer environment variable, tolerating blank/unset values."""
     raw = os.environ.get(name, "")
     try:

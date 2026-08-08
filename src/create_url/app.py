@@ -1,44 +1,65 @@
 """POST /urls — create a short link.
 
-Request body (JSON)::
-
+Request body
+------------
     {
-      "url": "https://example.com/some/very/long/path",  # required
+      "url": "https://example.com/some/very/long/path",   # required
       "customCode": "spring-sale",                        # optional
       "expiresInDays": 30,                                # optional
       "owner": "user-123"                                 # optional
     }
 
-Behaviour
+Responses
 ---------
-* If ``customCode`` is supplied it is validated and claimed atomically; a clash
-  returns ``409 Conflict``.
-* Otherwise a random base62 code is generated and claimed, retrying on
-  collision (see :func:`urlshortener_common.shortcode.generate_unique_code`).
-* ``expiresInDays`` sets an absolute expiry; the link then 410s after that time
-  and is eventually reaped by DynamoDB TTL.
+201  created
+400  invalid input
+409  the requested customCode is taken
+503  no unique random code could be allocated within the retry budget
+
+Handlers stay thin: this module owns HTTP concerns — parsing, validation,
+status codes, response shape. Storage logic lives in ``dynamo``, short-code
+logic in ``shortcode``.
 """
 
 import time
 from urllib.parse import urlparse
 
-from urlshortener_common import config, dynamo, metrics, responses, shortcode
+from urlshortener_common import dynamo, metrics, responses, shortcode
 
-# Cap how far in the future a link may be set to expire (~10 years).
+# Cap how far ahead a link may be set to expire (~10 years).
 _MAX_EXPIRY_DAYS = 3650
 
+# Longest destination URL accepted. Browsers stop being reliable well before
+# 2 KB, and unbounded input is a liability: a DynamoDB item caps at 400 KB, so
+# a large enough URL turns a clean rejection into an unhandled write failure —
+# and storage is billed by the byte with no authentication in front.
+_MAX_URL_LENGTH = 2048
 
-def _is_valid_url(url: str) -> bool:
-    """Accept only absolute http(s) URLs with a host."""
+
+def _is_valid_url(url):
+    """True if ``url`` is an absolute http(s) URL within the length cap.
+
+    The scheme check is an allowlist, not a blocklist. Without it a
+    ``javascript:`` or ``data:`` URL could be shortened, and the short domain
+    would lend credibility to an XSS payload. A blocklist is only ever a list
+    of the attacks already thought of.
+    """
+    if len(url) > _MAX_URL_LENGTH:
+        return False
     try:
         parsed = urlparse(url)
     except ValueError:
         return False
+    # Both halves matter: urlparse is forgiving and turns "not-a-url" into a
+    # bare path with no scheme and no netloc rather than raising.
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
-def _compute_expiry(body: dict) -> int | None:
-    """Translate ``expiresInDays`` into an absolute epoch, or ``None``.
+def _compute_expiry(body):
+    """Translate ``expiresInDays`` into an absolute epoch, or None.
+
+    Storing a relative duration would be meaningless on read, so the value is
+    converted to the instant it expires.
 
     Raises
     ------
@@ -48,25 +69,35 @@ def _compute_expiry(body: dict) -> int | None:
     days = body.get("expiresInDays")
     if days is None:
         return None
-    if not isinstance(days, (int, float)) or days <= 0 or days > _MAX_EXPIRY_DAYS:
+    # bool is a subclass of int in Python, so `isinstance(True, int)` is True.
+    # Excluded explicitly, or {"expiresInDays": true} silently means "1 day".
+    if (
+        isinstance(days, bool)
+        or not isinstance(days, (int, float))
+        or days <= 0
+        or days > _MAX_EXPIRY_DAYS
+    ):
         raise ValueError(
-            f"expiresInDays must be a positive number <= {_MAX_EXPIRY_DAYS}."
+            f"expiresInDays must be a positive number no more than {_MAX_EXPIRY_DAYS}"
         )
     return int(time.time()) + int(days * 86400)
 
 
 def handler(event, context):
-    # ---- Parse & validate input ------------------------------------------
+    """Create a short link with an optional custom code and expiry.
+
+    Each try/except below wraps exactly the call that can raise. A wider block
+    would report an internal failure as a 400 — blaming the caller for our bug
+    and swallowing the traceback that would have located it.
+    """
     try:
         body = responses.parse_json_body(event)
     except ValueError:
-        return responses.error(400, "Request body must be valid JSON.")
+        return responses.error(400, "Request body is not valid JSON")
 
     long_url = (body.get("url") or "").strip()
-    if not long_url:
-        return responses.error(400, "Field 'url' is required.")
-    if not _is_valid_url(long_url):
-        return responses.error(400, "Field 'url' must be an absolute http(s) URL.")
+    if not long_url or not _is_valid_url(long_url):
+        return responses.error(400, "Invalid URL")
 
     try:
         expires_at = _compute_expiry(body)
@@ -74,38 +105,26 @@ def handler(event, context):
         return responses.error(400, str(exc))
 
     owner = (body.get("owner") or "anonymous").strip() or "anonymous"
+    custom_code = (body.get("customCode") or "").strip()
 
-    # ---- Claim a short code ----------------------------------------------
-    custom_code = body.get("customCode")
     if custom_code:
-        custom_code = custom_code.strip()
         if not shortcode.is_valid_custom_code(custom_code):
-            return responses.error(
-                400,
-                "customCode must be 3-64 chars of letters, digits, '-' or '_' "
-                "and not a reserved word.",
-            )
-        claimed = dynamo.put_url(
-            custom_code,
-            long_url,
-            owner=owner,
-            expires_at=expires_at,
-            custom=True,
+            return responses.error(400, "Invalid custom code")
+        ok = dynamo.put_url(
+            custom_code, long_url, owner=owner, expires_at=expires_at, custom=True
         )
-        if not claimed:
+        if not ok:
             metrics.count("ShortCodeCollision")
-            return responses.error(409, f"Short code '{custom_code}' is already taken.")
+            # Terminal, not retryable: the caller asked for one specific code,
+            # and silently substituting a different one would be worse.
+            return responses.error(409, "Custom code already taken")
         code = custom_code
     else:
-        # Track collisions for observability, then delegate retry logic to the
-        # generator. The lambda passed to it performs the atomic claim.
-        def try_claim(candidate: str) -> bool:
+
+        def try_claim(candidate):
+            """Attempt to atomically claim ``candidate``; True if it stuck."""
             ok = dynamo.put_url(
-                candidate,
-                long_url,
-                owner=owner,
-                expires_at=expires_at,
-                custom=False,
+                candidate, long_url, owner=owner, expires_at=expires_at, custom=False
             )
             if not ok:
                 metrics.count("ShortCodeCollision")
@@ -114,19 +133,16 @@ def handler(event, context):
         try:
             code = shortcode.generate_unique_code(try_claim)
         except shortcode.ShortCodeCollisionError:
-            return responses.error(
-                503, "Could not allocate a unique short code; please retry."
-            )
+            # 503, not 500: a retry genuinely will succeed, because the next
+            # candidate is drawn fresh.
+            return responses.error(503, "Could not find a free short code")
 
-    # ---- Emit metrics & respond ------------------------------------------
     metrics.count("LinksCreated")
-
-    base_url = _base_url(event)
     return responses.json_response(
         201,
         {
             "shortCode": code,
-            "shortUrl": f"{base_url}/{code}",
+            "shortUrl": f"{_base_url(event)}/{code}",
             "longUrl": long_url,
             "owner": owner,
             "custom": bool(custom_code),
@@ -136,13 +152,19 @@ def handler(event, context):
     )
 
 
-def _base_url(event) -> str:
-    """Reconstruct the public base URL of the API from the request context."""
+def _base_url(event):
+    """Reconstruct the API's public base URL from the request itself.
+
+    Derived rather than configured, so dev, staging, prod and a local
+    ``sam local`` on :3000 are all correct with no environment-specific
+    settings to drift.
+    """
     headers = {str(k).lower(): v for k, v in (event.get("headers") or {}).items()}
     host = headers.get("host", "")
     proto = headers.get("x-forwarded-proto", "https")
-    ctx = event.get("requestContext") or {}
-    stage = ctx.get("stage", "")
+    stage = (event.get("requestContext") or {}).get("stage", "")
     if host and stage:
         return f"{proto}://{host}/{stage}"
-    return f"https://{host}" if host else ""
+    if host:
+        return f"https://{host}"
+    return ""

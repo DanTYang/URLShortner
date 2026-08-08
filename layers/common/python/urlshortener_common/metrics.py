@@ -1,30 +1,27 @@
 """CloudWatch metrics via the Embedded Metric Format (EMF).
 
-Rather than calling the ``PutMetricData`` API on the hot path (which adds
-latency and cost to every request), we emit metrics as specially-structured
-JSON log lines. CloudWatch automatically parses these EMF documents out of the
-Lambda log stream and turns them into real metrics — no extra API call, no
-added request latency.
+Calling ``PutMetricData`` on the redirect path would add a network round trip
+to every request, cost per call, and introduce another failure mode while a
+user waits. Instead this module writes specially-structured JSON to stdout,
+which Lambda already ships to CloudWatch Logs. CloudWatch parses those
+documents asynchronously into real metrics — graphable and alarmable, for the
+cost of a write to stdout and no added request latency.
 
-Reference: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html
+Three details are load-bearing, and each fails *silently* if wrong: the
+timestamp must be epoch milliseconds, every declared dimension must also appear
+as a top-level key, and the document must occupy exactly one line.
+
+Spec: https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format_Specification.html
 """
 
 import json
 import sys
 import time
-from typing import Optional
 
 from . import config
 
 
-def emit(
-    metric_name: str,
-    value: float = 1.0,
-    *,
-    unit: str = "Count",
-    dimensions: Optional[dict[str, str]] = None,
-    extra: Optional[dict[str, object]] = None,
-) -> None:
+def emit(metric_name, value=1.0, *, unit="Count", dimensions=None, extra=None):
     """Emit a single CloudWatch metric as an EMF log line.
 
     Parameters
@@ -32,24 +29,28 @@ def emit(
     metric_name:
         e.g. ``"Redirects"`` or ``"ClicksByCountry"``.
     value:
-        The metric value (defaults to 1, i.e. "count one occurrence").
+        The metric value; defaults to 1.
     unit:
-        A CloudWatch unit ("Count", "Milliseconds", ...).
+        A CloudWatch unit — ``"Count"``, ``"Milliseconds"``, ``"Bytes"``, ...
     dimensions:
-        Optional dimension map, e.g. ``{"Country": "US"}``. Dimensions let you
-        slice the same metric (clicks) by facet (country) in the dashboard.
-    extra:
-        Additional non-metric fields to include in the structured log for
-        debugging / querying with CloudWatch Logs Insights.
-    """
-    dims = dimensions or {}
+        Facets to slice by, e.g. ``{"Country": "US"}``.
 
-    document: dict[str, object] = {
+        Keep cardinality low. Every distinct dimension *value* becomes a
+        separately-billed custom metric: ``{"Country": ...}`` is ~200 metrics,
+        whereas ``{"ShortCode": ...}`` would be one per link, forever.
+    extra:
+        Additional non-metric fields, included in the structured log for
+        querying with CloudWatch Logs Insights but not billed as metrics.
+    """
+    timestamp = int(time.time() * 1000)
+    dims = dimensions or {}
+    document = {
         "_aws": {
-            "Timestamp": int(time.time() * 1000),
+            "Timestamp": timestamp,
             "CloudWatchMetrics": [
                 {
                     "Namespace": config.METRICS_NAMESPACE,
+                    # A list of dimension *sets*, hence the double nesting.
                     "Dimensions": [list(dims.keys())] if dims else [[]],
                     "Metrics": [{"Name": metric_name, "Unit": unit}],
                 }
@@ -57,19 +58,22 @@ def emit(
         },
         metric_name: value,
     }
+    # Declared dimensions must also exist at the top level, or CloudWatch
+    # discards the document without an error.
     document.update(dims)
     if extra:
         document.update(extra)
 
-    # EMF is picked up from stdout in the Lambda log stream.
+    # One document per line: EMF is parsed per log line, so an embedded newline
+    # splits the document and both halves are dropped.
     sys.stdout.write(json.dumps(document) + "\n")
 
 
-def count(metric_name: str, dimensions: Optional[dict[str, str]] = None) -> None:
-    """Convenience wrapper: emit a count of 1 for ``metric_name``."""
+def count(metric_name, dimensions=None):
+    """Emit a count of 1 for ``metric_name``."""
     emit(metric_name, 1.0, unit="Count", dimensions=dimensions)
 
 
-def timing(metric_name: str, milliseconds: float) -> None:
-    """Convenience wrapper: emit a duration metric in milliseconds."""
+def timing(metric_name, milliseconds):
+    """Emit a duration metric in milliseconds."""
     emit(metric_name, milliseconds, unit="Milliseconds")

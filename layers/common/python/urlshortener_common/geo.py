@@ -1,61 +1,81 @@
-"""Extract analytics facets (country, referrer, client) from an API event.
+"""Extract analytics facets from an API Gateway event.
 
-None of this requires a third-party GeoIP database. When the API sits behind
-CloudFront, AWS injects a ``CloudFront-Viewer-Country`` header derived from the
-client IP — a free, accurate ISO country code. We read that when present and
-degrade gracefully to ``UNKNOWN`` otherwise.
+No third-party GeoIP database is required. When the API is fronted by
+CloudFront, AWS resolves the client IP at the edge and injects a
+``CloudFront-Viewer-Country`` header — free, accurate, and the raw IP never
+reaches this code.
+
+``get_referrer`` deliberately keeps only the *host*. Full referrer URLs
+routinely carry search terms, session tokens and internal paths; data that is
+never collected cannot leak.
 """
 
-from typing import Any
 from urllib.parse import urlparse
 
 
-def _headers(event: dict[str, Any]) -> dict[str, str]:
-    """Return request headers with case-insensitive lookup."""
-    raw = event.get("headers") or {}
-    return {str(k).lower(): v for k, v in raw.items()}
+def _headers(event):
+    """Return request headers with lowercased keys.
+
+    HTTP header names are case-insensitive, and clients and proxies disagree
+    about casing (``Referer``, ``referer``, ``REFERER``). Normalising once here
+    lets every reader below index lowercase and be correct.
+    """
+    if event.get("headers") is None:
+        return {}
+    return {str(k).lower(): v for k, v in event.get("headers").items()}
 
 
-def get_country(event: dict[str, Any]) -> str:
-    """Best-effort ISO-3166 country code for the requester.
+def get_country(event):
+    """Best-effort ISO-3166 country code, or ``"UNKNOWN"``.
 
-    Priority:
-      1. ``CloudFront-Viewer-Country`` (present when fronted by CloudFront).
-      2. ``X-Country`` (lets callers/tests inject a value).
-      3. ``"UNKNOWN"``.
+    Priority: ``CloudFront-Viewer-Country``, then ``X-Country`` (an injection
+    point for tests and local curl), then the sentinel.
+
+    ``"UNKNOWN"`` is returned intact rather than truncated — ``"UN"`` is a real
+    country code and reporting it would be a fabrication.
     """
     headers = _headers(event)
-    country = (
-        headers.get("cloudfront-viewer-country")
-        or headers.get("x-country")
-        or "UNKNOWN"
-    )
-    return country.upper()[:2] if country != "UNKNOWN" else "UNKNOWN"
+    country = headers.get("cloudfront-viewer-country") or headers.get("x-country")
+    if country is None:
+        return "UNKNOWN"
+    return country.upper()[:2]
 
 
-def get_referrer(event: dict[str, Any]) -> str:
-    """Return the referring host, or ``"direct"`` if there is none.
+def get_referrer(event):
+    """Return the referring host, or ``"direct"`` when there is none.
 
-    We deliberately keep only the *host* (e.g. ``t.co``), not the full URL, so
-    analytics group cleanly by traffic source and we don't retain query
-    strings that may contain personal data.
+    Only ``netloc`` is kept: analytics group cleanly by traffic source, and no
+    query strings or paths are retained. A malformed referrer yields an empty
+    host and falls back to ``"direct"`` rather than producing an empty facet.
     """
     headers = _headers(event)
-    # HTTP misspelled "referrer" as "referer" in 1996 and we're stuck with it.
-    referer = headers.get("referer") or headers.get("referrer")
-    if not referer:
+    # HTTP misspelled "referrer" as "referer" in 1996; some clients send the
+    # correct spelling, so both are checked.
+    header = headers.get("referer") or headers.get("referrer")
+    if header is None:
         return "direct"
-    host = urlparse(referer).netloc
-    return host.lower() or "direct"
+    netloc = urlparse(header).netloc
+    if not netloc:
+        return "direct"
+    return netloc.lower()
 
 
-def get_user_agent(event: dict[str, Any]) -> str:
-    """Return the User-Agent string, or empty."""
+def get_user_agent(event):
+    """Return the User-Agent header, or an empty string."""
     return _headers(event).get("user-agent", "")
 
 
-def get_source_ip(event: dict[str, Any]) -> str:
-    """Return the client IP as reported by API Gateway (best effort)."""
-    ctx = event.get("requestContext") or {}
-    identity = ctx.get("identity") or {}
-    return identity.get("sourceIp", "")
+def get_source_ip(event):
+    """Return the client IP as API Gateway reports it, or an empty string.
+
+    Every level is guarded with ``or {}`` rather than a ``.get`` default: the
+    keys exist with null values, and a default only applies when a key is
+    absent.
+
+    Provided for completeness — nothing in this service stores the result. An
+    IP address is personal data under GDPR, and country already arrives from
+    CloudFront without it.
+    """
+    return ((event.get("requestContext") or {}).get("identity") or {}).get(
+        "sourceIp", ""
+    )
