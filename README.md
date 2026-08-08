@@ -1,13 +1,21 @@
 # Serverless URL Shortener
 
-A production-shaped URL shortening service on AWS Lambda, API Gateway and
-DynamoDB, defined end to end as infrastructure-as-code with AWS SAM.
+A URL shortening service built on AWS Lambda, API Gateway and DynamoDB, defined
+end to end as infrastructure-as-code with AWS SAM.
 
-Custom short codes with race-free collision detection, optional link expiry,
-and per-link click analytics (counts, geography, referrers) surfaced through
-CloudWatch metrics and a dependency-free browser dashboard.
+Supports custom short codes, race-free collision detection, optional link
+expiry, and per-link click analytics covering counts, geography and referrers.
+Analytics are surfaced through CloudWatch metrics and a dependency-free browser
+dashboard.
 
----
+## Endpoints
+
+| Method and path | Purpose |
+|---|---|
+| `POST /urls` | Create a short link. Auto-generated or custom code, optional expiry. |
+| `GET /{shortCode}` | Resolve a code, record a click, return a `301`. |
+| `GET /urls/{shortCode}/analytics` | Click totals and breakdowns for one link. |
+| `GET /urls` | List links, optionally filtered by owner. |
 
 ## Architecture
 
@@ -33,68 +41,80 @@ CloudWatch metrics and a dependency-free browser dashboard.
                         └──────── EMF metrics ─────┴────────► CloudWatch
 ```
 
-| Method & path | Purpose |
-|---|---|
-| `POST /urls` | Create a short link — auto or custom code, optional expiry |
-| `GET /{shortCode}` | Resolve, record a click, `301` to the target |
-| `GET /urls/{shortCode}/analytics` | Click totals and breakdowns for one link |
-| `GET /urls` | List links, optionally filtered by owner |
+Four single-purpose Lambda functions share one layer containing the storage,
+metrics and request-parsing helpers. Two DynamoDB tables hold link mappings and
+raw click events. Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-Full details in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+### Data model
 
----
+`UrlsTable` is partitioned on `shortCode`, so redirect lookups are single-key
+`GetItem` calls. A global secondary index on `owner` and `createdAt` serves
+per-owner listings without a table scan.
 
-## Design decisions worth reading
+`ClicksTable` is partitioned on `shortCode` with a sort key of
+`<iso-timestamp>#<uuid8>`, so all clicks for a link are stored together in
+chronological order and can be range-queried directly.
 
-**Collision detection belongs to the database.** The naive approach — check
-whether a code exists, then write it — is a read-then-write race that no amount
-of application code fixes. Every claim here is a single conditional write:
+## Design decisions
+
+### Collision detection is delegated to the database
+
+Checking whether a code exists and then writing it is a read-then-write race:
+two concurrent requests can both observe the code as free and both write. Every
+claim is instead a single conditional write.
 
 ```python
 table.put_item(Item=item, ConditionExpression="attribute_not_exists(shortCode)")
 ```
 
-DynamoDB evaluates that atomically, so exactly one writer wins under any
-concurrency and the loser simply retries with a fresh candidate. Uniqueness
-becomes a property of the storage engine rather than something the application
-has to coordinate. The same reasoning drives the atomic `UpdateExpression` used
-for click counts.
+DynamoDB evaluates the condition atomically, so exactly one writer succeeds
+under any level of concurrency. The losing request retries with a fresh
+candidate. Click counters use an atomic `UpdateExpression` for the same reason.
 
-**Codes come from a CSPRNG, not a counter.** Sequential IDs are dense and
-enumerable. Since a short link is a bearer token — knowing the code is enough to
-follow it — codes are drawn from `secrets` over a 62-symbol alphabet.
+### Short codes are drawn from a CSPRNG
 
-**Metrics ride the log stream.** Calling `PutMetricData` on the redirect path
-would add a network round trip to every request. Instead the functions emit
-CloudWatch Embedded Metric Format documents to stdout, which Lambda already
-ships; CloudWatch parses them into real metrics asynchronously. Zero added
-request latency.
+Sequential identifiers encoded to base62 are dense and enumerable. A short link
+is a bearer token, since knowing the code is sufficient to follow it, so codes
+come from `secrets` over a 62-symbol alphabet. Seven characters give roughly
+3.5 trillion combinations. Sustained collisions widen the code by one character.
 
-**Analytics is best-effort, deliberately.** Resolving the link is the user's
-goal; recording the click is ours. The click write is wrapped so a failure
-loses the event rather than the redirect — an explicit decision about which
-failure is worse, documented at the call site.
+### Metrics are emitted through the log stream
 
-**Two-tier click accounting.** The lifetime total is an atomic counter on the
-URL row and lives forever; the detailed breakdowns come from raw click events
-that TTL out after 90 days. Long-term totals without paying to store every raw
-event forever.
+Calling `PutMetricData` on the redirect path would add a network round trip to
+every request. The functions instead write CloudWatch Embedded Metric Format
+documents to stdout, which Lambda already ships to CloudWatch Logs. CloudWatch
+extracts them into metrics asynchronously, adding no request latency.
 
-**Least privilege in IAM.** The two read-only functions get
-`DynamoDBReadPolicy` rather than `Crud`, and the list function has no access to
-the clicks table at all — so a bug in one bounds its own blast radius.
+### Analytics recording is best-effort
 
----
+Resolving a link is the request's purpose; recording the click is a side
+effect. The click write is wrapped so that a failure loses the event rather
+than the redirect. The trade-off is documented at the call site.
+
+### Click accounting is two-tier
+
+Lifetime totals come from an atomic counter on the URL row and persist
+indefinitely. Country, referrer and daily breakdowns are computed from raw
+click events, which expire after 90 days via DynamoDB TTL. Long-term totals are
+retained without storing every raw event permanently.
+
+### IAM follows least privilege
+
+The two read-only functions receive `DynamoDBReadPolicy` rather than
+`DynamoDBCrudPolicy`. `ListUrlsFunction` has no access to the clicks table at
+all. A fault in any one function is bounded by the permissions of its own role.
 
 ## Deploying
+
+Requires the AWS SAM CLI and configured AWS credentials.
 
 ```bash
 sam validate --lint
 sam build
-sam deploy --guided          # first run; answers are saved to samconfig.toml
+sam deploy --guided     # first run only; answers are saved to samconfig.toml
 ```
 
-The stack prints an `ApiBaseUrl` on completion:
+The stack outputs an `ApiBaseUrl` on completion.
 
 ```bash
 API=https://xxxx.execute-api.us-east-1.amazonaws.com/dev
@@ -102,60 +122,83 @@ API=https://xxxx.execute-api.us-east-1.amazonaws.com/dev
 curl -s -X POST "$API/urls" -H 'Content-Type: application/json' \
   -d '{"url":"https://aws.amazon.com/lambda/","customCode":"lambda"}'
 
-curl -si "$API/lambda" | head -3          # 301 + Location
-curl -s "$API/urls/lambda/analytics"      # the click, recorded
+curl -si "$API/lambda" | head -3
+curl -s "$API/urls/lambda/analytics"
 ```
 
-`samconfig.toml` holds named `dev` / `staging` / `prod` configurations, so
-replicating an environment is `sam deploy --config-env staging`.
+`samconfig.toml` holds named `dev`, `staging` and `prod` configurations, so
+replicating an environment is `sam deploy --config-env staging`. Teardown is
+`make delete`. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 
-Tear down with `make delete`. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+## Configuration
 
----
+Every tunable value is a CloudFormation parameter, so the same artifact deploys
+unchanged across environments.
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `Environment` | `dev` | Namespaces all resources and the metrics namespace |
+| `ShortCodeLength` | `7` | Base62 characters per generated code |
+| `ClickRetentionDays` | `90` | Lifetime of raw click events before TTL deletion |
+| `MaxCollisionRetries` | `5` | Collision retries before returning `503` |
 
 ## Repository layout
 
 ```
-template.yaml            # the entire infrastructure, one file
-samconfig.toml           # per-environment deploy settings
-src/                     # one directory per Lambda
+template.yaml            complete infrastructure definition
+samconfig.toml           per-environment deploy settings
+src/                     one directory per Lambda function
   create_url/  redirect/  get_analytics/  list_urls/
-layers/common/           # shared code, deployed as a Lambda layer
+layers/common/           shared code, deployed as a Lambda layer
   python/urlshortener_common/
     config.py  shortcode.py  dynamo.py  metrics.py  geo.py  responses.py
-dashboard/index.html     # dependency-free browser client
-events/                  # sample API Gateway events for local invocation
-docs/                    # architecture, API reference, deployment, analytics
+dashboard/index.html     single-file browser client, no build step
+events/                  sample API Gateway events for local invocation
+docs/                    architecture, API reference, deployment, analytics
 ```
 
----
+## Cost and scaling
 
-## Known limitations
+DynamoDB uses on-demand billing, so capacity scales with traffic and idle cost
+is negligible. Redirects are single-key lookups keyed on a random code, which
+distributes evenly across partitions and avoids hot keys. `301` responses carry
+a `Cache-Control` header, so repeat traffic to a popular link is served by
+browsers and CDNs without invoking Lambda.
 
-Deliberate scope choices, not oversights. Each is something I would address
-before this served real traffic:
+Approximate order of magnitude in `us-east-1`: one million redirects costs a few
+dollars, dominated by API Gateway request pricing.
 
-- **No authentication.** The redirect endpoint is correctly public — that is
-  the product. The other three are not, and `owner` is a client-supplied string,
-  so it groups links rather than protecting them. Minimum fix is API Gateway
-  API keys; the right fix is a Cognito authorizer with the owner read from the
-  verified token rather than the request body.
-- **Click recording is synchronous**, tripling DynamoDB operations on the
-  busiest endpoint. Off the request path via DynamoDB Streams or SQS at volume.
-- **Analytics aggregates up to 5,000 events per request**, and reports
-  `truncated` when it hits that bound. Precomputed daily rollups are the real
-  answer.
-- **Geography depends on CloudFront** for the `CloudFront-Viewer-Country`
-  header. Behind a bare API Gateway URL it degrades to `UNKNOWN`.
-- **Cached 301s outlive short expiries.** A one-hour link stays in a browser
-  cache for the full `max-age`. Capping `max-age` at the remaining TTL, or
-  serving `302` for expiring links, resolves it.
-- **No malicious-URL screening.** The failure that actually kills a shortener
-  is the domain landing on a phishing blocklist, which breaks every link ever
-  issued. A Safe Browsing check at creation is the highest-value addition here.
+## Limitations
 
----
+The following are known and unaddressed in the current scope.
+
+**No authentication.** The redirect endpoint is intentionally public. The other
+three are not protected, and `owner` is a client-supplied string, so it groups
+links rather than restricting access to them. API Gateway API keys would be the
+minimum fix; a Cognito authorizer reading the owner from a verified token is the
+correct one.
+
+**Synchronous click recording.** Each redirect performs one read and two writes,
+tripling DynamoDB operations on the highest-traffic endpoint. Moving the write
+off the request path via DynamoDB Streams or SQS would remove that cost.
+
+**Bounded analytics aggregation.** The analytics endpoint reads at most 5,000
+click events per request and reports `truncated` when that bound is reached.
+Precomputed daily rollups would remove the bound.
+
+**Geography depends on CloudFront.** Country is read from the
+`CloudFront-Viewer-Country` header. Behind a bare API Gateway URL the value
+degrades to `UNKNOWN`.
+
+**Cached redirects outlive short expiries.** A `301` is cached for the duration
+of its `Cache-Control` header, so a link expiring sooner than that continues to
+resolve from cache. Capping `max-age` at the remaining TTL, or serving `302`
+for expiring links, resolves it.
+
+**No destination screening.** Submitted URLs are validated for scheme and
+length but not checked against a malicious-URL list. A shortener domain that
+lands on a phishing blocklist breaks every link it has issued.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
