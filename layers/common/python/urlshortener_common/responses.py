@@ -50,17 +50,23 @@ def error(status_code, message, **extra):
     return json_response(status_code, payload)
 
 
-def redirect(location, *, status_code = 301):
+def redirect(location, *, status_code = 302, max_age = 60):
     """Build an HTTP redirect response.
 
-    Defaults to 301 (permanent) so browsers and crawlers cache the mapping,
-    which offloads repeat traffic from Lambda entirely.
+    Defaults to 302 rather than 301. Every link in this service can be deleted
+    or can expire, so no redirect is genuinely permanent, and a 301 asserts
+    otherwise. Some intermediaries cache a 301 indefinitely regardless of
+    Cache-Control, which cannot be risked once links are revocable.
+
+    ``max_age`` is the caller's staleness budget, not a performance knob. Once
+    a response is cached there is no mechanism to revoke it, so this value is
+    the worst case for how long a deleted or expired link keeps resolving.
     """
     return {
         "statusCode": status_code,
         "headers": {
             "Location": location,
-            "Cache-Control": "public, max-age=86400",
+            "Cache-Control": f"public, max-age={max_age}",
         },
         "body": "",
     }

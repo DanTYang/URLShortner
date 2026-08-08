@@ -18,7 +18,21 @@ operations on the busiest endpoint in the system. At high volume it belongs off
 the request path entirely — DynamoDB Streams or an SQS fan-out.
 """
 
+import time
+
 from urlshortener_common import dynamo, geo, metrics, responses
+
+# How long a client may cache a redirect. This is a correctness budget, not a
+# performance setting: a cached response cannot be revoked, so this is the
+# worst case for how long a deleted or expired link keeps resolving.
+#
+# Browser caches are per-client, so they do nothing for distinct visitors — a
+# thousand people clicking a viral link is a thousand cache misses regardless.
+# The cache only absorbs repeat clicks from the same browser, which makes a
+# short window cheap: at a million redirects a month the difference between 60
+# and 300 seconds is well under a dollar. A CDN in front would change that
+# calculus, because a shared cache serves everyone from one fetch.
+_MAX_CACHE_SECONDS = 60
 
 
 def handler(event, context):
@@ -54,7 +68,21 @@ def handler(event, context):
     _record_analytics(event, short_code)
 
     metrics.count("Redirects")
-    return responses.redirect(row["longUrl"], status_code=301)
+    return responses.redirect(row["longUrl"], max_age=_cache_seconds(row))
+
+
+def _cache_seconds(row):
+    """How long a client may cache this redirect.
+
+    Capped at the link's remaining lifetime, so the cache entry never outlives
+    the link it points at. A link with twenty seconds left is cached for twenty
+    seconds, not sixty.
+    """
+    expires_at = row.get("expiresAt")
+    if expires_at is None:
+        return _MAX_CACHE_SECONDS
+    remaining = int(expires_at) - int(time.time())
+    return max(0, min(_MAX_CACHE_SECONDS, remaining))
 
 
 def _record_analytics(event, short_code):

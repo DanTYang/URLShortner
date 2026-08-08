@@ -13,7 +13,7 @@ dashboard.
 | Method and path | Purpose |
 |---|---|
 | `POST /urls` | Create a short link. Auto-generated or custom code, optional expiry. |
-| `GET /{shortCode}` | Resolve a code, record a click, return a `301`. |
+| `GET /{shortCode}` | Resolve a code, record a click, return a `302`. |
 | `GET /urls/{shortCode}/analytics` | Click totals and breakdowns for one link. |
 | `GET /urls` | List links, optionally filtered by owner. |
 
@@ -91,6 +91,23 @@ Resolving a link is the request's purpose; recording the click is a side
 effect. The click write is wrapped so that a failure loses the event rather
 than the redirect. The trade-off is documented at the call site.
 
+### Redirects are cached briefly, not permanently
+
+Redirects return `302` with a one-minute `Cache-Control` window, capped at the
+link's remaining lifetime. A cached response cannot be revoked, so that window
+is the worst case for how long a deleted or expired link keeps resolving.
+
+`301` would allow longer caching and fewer invocations, but it asserts
+permanence, and some intermediaries cache a `301` indefinitely regardless of
+`Cache-Control`. Since every link here can be deleted or expire, that claim
+would be false.
+
+The cost of the short window is small because browser caches are per-client and
+do nothing for distinct visitors: a thousand people clicking one link is a
+thousand cache misses at any `max-age`. Only repeat clicks from the same
+browser are absorbed. A CDN in front would change this, since a shared cache
+serves every visitor from one fetch.
+
 ### Click accounting is two-tier
 
 Lifetime totals come from an atomic counter on the URL row and persist
@@ -161,9 +178,9 @@ docs/                    architecture, API reference, deployment, analytics
 
 DynamoDB uses on-demand billing, so capacity scales with traffic and idle cost
 is negligible. Redirects are single-key lookups keyed on a random code, which
-distributes evenly across partitions and avoids hot keys. `301` responses carry
-a `Cache-Control` header, so repeat traffic to a popular link is served by
-browsers and CDNs without invoking Lambda.
+distributes evenly across partitions and avoids hot keys. Redirects carry a
+short `Cache-Control` window, which absorbs repeat clicks from the same browser
+but not traffic from distinct visitors.
 
 Approximate order of magnitude in `us-east-1`: one million redirects costs a few
 dollars, dominated by API Gateway request pricing.
@@ -189,11 +206,6 @@ Precomputed daily rollups would remove the bound.
 **Geography depends on CloudFront.** Country is read from the
 `CloudFront-Viewer-Country` header. Behind a bare API Gateway URL the value
 degrades to `UNKNOWN`.
-
-**Cached redirects outlive short expiries.** A `301` is cached for the duration
-of its `Cache-Control` header, so a link expiring sooner than that continues to
-resolve from cache. Capping `max-age` at the remaining TTL, or serving `302`
-for expiring links, resolves it.
 
 **No destination screening.** Submitted URLs are validated for scheme and
 length but not checked against a malicious-URL list. A shortener domain that

@@ -67,13 +67,17 @@ link points at.
 ### Responses
 | Status | Meaning | Headers |
 |---|---|---|
-| `301 Moved Permanently` | Found; redirecting. | `Location: <longUrl>`, `Cache-Control: public, max-age=86400` |
+| `302 Found` | Found; redirecting. | `Location: <longUrl>`, `Cache-Control: public, max-age=<=60` |
 | `404 Not Found` | No such code. | — |
 | `410 Gone` | The link existed but has expired. | — |
 
 Side effect: a successful redirect records a click event (country, referrer,
 timestamp), atomically increments the link's `clickCount`, and emits
 CloudWatch metrics. Analytics is best-effort and never blocks the redirect.
+
+The `Cache-Control` window is capped at the link's remaining lifetime and never
+exceeds 60 seconds. A cached redirect cannot be revoked, so that window bounds
+how long a deleted or expired link continues to resolve.
 
 ### Example
 ```bash
@@ -82,9 +86,9 @@ curl -sL "$API/lambda"
 
 # See just the redirect itself
 curl -si "$API/lambda" | head -n 3
-#   HTTP/2 301
+#   HTTP/2 302
 #   location: https://aws.amazon.com/lambda/
-#   cache-control: public, max-age=86400
+#   cache-control: public, max-age=60
 ```
 
 > **Geography:** country is read from the `CloudFront-Viewer-Country` header,
