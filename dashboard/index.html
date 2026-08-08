@@ -165,6 +165,22 @@
 <script>
   // --- tiny helpers --------------------------------------------------------
   const $ = (id) => document.getElementById(id);
+
+  // Escape anything that came from the server before putting it in innerHTML.
+  //
+  // A destination URL is attacker-controlled: the API only validates the
+  // scheme and host, so everything after them is free-form. Interpolating one
+  // raw would let a saved link like
+  //     https://example.com/"><img src=x onerror=...>
+  // execute in the browser of anyone who opens this page. You cannot fix that
+  // by validating URLs harder -- it genuinely IS a valid URL. Escape on output.
+  const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+
+  // Only allow http(s) destinations into an href, so a stored javascript:
+  // URL can never become a clickable payload.
+  const safeHref = (u) => /^https?:\/\//i.test(String(u || "")) ? String(u) : "#";
   const API = () => $("apiBase").value.replace(/\/+$/, "");
   // Persist the API base URL locally so you don't retype it every visit.
   $("apiBase").value = localStorage.getItem("apiBase") || "";
@@ -194,8 +210,8 @@
         body: JSON.stringify(body),
       });
       $("createResult").innerHTML =
-        `Short URL: <a class="short-url" href="${data.shortUrl}" target="_blank">${data.shortUrl}</a>` +
-        (data.expiresAt ? `<div class="muted">Expires: ${new Date(data.expiresAt * 1000).toLocaleString()}</div>` : "");
+        `Short URL: <a class="short-url" href="${esc(safeHref(data.shortUrl))}" target="_blank" rel="noopener noreferrer">${esc(data.shortUrl)}</a>` +
+        (data.expiresAt ? `<div class="muted">Expires: ${esc(new Date(Number(data.expiresAt) * 1000).toLocaleString())}</div>` : "");
     } catch (e) {
       $("createError").textContent = e.message;
     }
@@ -209,9 +225,9 @@
     const max = Math.max(...entries.map(([, v]) => v));
     el.innerHTML = entries.map(([k, v]) => `
       <div class="bar-row">
-        <div class="bar-label" title="${k}">${k}</div>
-        <div class="bar-track"><div class="bar-fill" style="width:${(v / max) * 100}%"></div></div>
-        <div class="bar-val">${v}</div>
+        <div class="bar-label" title="${esc(k)}">${esc(k)}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${Number(v) / max * 100}%"></div></div>
+        <div class="bar-val">${esc(v)}</div>
       </div>`).join("");
   }
 
@@ -225,9 +241,9 @@
     const y = (v) => H - pad - (v * (H - 2 * pad)) / max;
     const pts = entries.map(([, v], i) => `${x(i)},${y(v)}`).join(" ");
     const dots = entries.map(([d, v], i) =>
-      `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" fill="#33d6a6"><title>${d}: ${v}</title></circle>`).join("");
+      `<circle cx="${x(i)}" cy="${y(v)}" r="3.5" fill="#33d6a6"><title>${esc(d)}: ${esc(v)}</title></circle>`).join("");
     const labels = entries.map(([d], i) =>
-      `<text x="${x(i)}" y="${H - 8}" text-anchor="middle">${d.slice(5)}</text>`).join("");
+      `<text x="${x(i)}" y="${H - 8}" text-anchor="middle">${esc(String(d).slice(5))}</text>`).join("");
     el.innerHTML =
       `<svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}">
         <polyline fill="none" stroke="#6c7bff" stroke-width="2" points="${pts}" />
@@ -267,11 +283,11 @@
         <thead><tr><th>Code</th><th>Destination</th><th>Clicks</th><th>Created</th><th></th></tr></thead>
         <tbody>${data.items.map(i => `
           <tr>
-            <td><code class="pill">${i.shortCode}</code></td>
-            <td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${i.longUrl}</td>
-            <td>${i.clickCount}</td>
-            <td class="muted">${(i.createdAt || "").slice(0, 10)}</td>
-            <td><button class="secondary" data-code="${i.shortCode}" style="margin:0;padding:4px 10px">Analytics</button></td>
+            <td><code class="pill">${esc(i.shortCode)}</code></td>
+            <td class="muted" style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(i.longUrl)}">${esc(i.longUrl)}</td>
+            <td>${esc(i.clickCount)}</td>
+            <td class="muted">${esc(String(i.createdAt || "").slice(0, 10))}</td>
+            <td><button class="secondary" data-code="${esc(i.shortCode)}" style="margin:0;padding:4px 10px">Analytics</button></td>
           </tr>`).join("")}
         </tbody></table>`;
       $("listTable").querySelectorAll("button[data-code]").forEach(b =>
