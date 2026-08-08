@@ -1,72 +1,74 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
+# ^ This one line is what makes it a SAM template rather than raw
+#   CloudFormation. SAM is a macro: AWS expands shorthand like
+#   `AWS::Serverless::Function` into the ~8 underlying resources (function,
+#   IAM role, permission, API method, integration...) that it really takes.
+#   Everything here is still CloudFormation underneath.
 
 Description: >
-  Serverless URL Shortener
-  -------------------------
-  A scalable URL shortening service built with AWS Lambda, API Gateway and
-  DynamoDB. Supports custom short codes, collision detection, optional link
-  expiration, and click analytics (counts, geography, referrers) surfaced
-  through CloudWatch metrics and a CloudWatch dashboard.
-
-  This template is the single source of truth for the whole stack. Deploy the
-  entire service with one command:
-
-      sam build && sam deploy --guided
+  Serverless URL Shortener — the single source of truth for the entire stack:
+  compute, storage, routing, IAM, dashboards and alarms. Nothing is configured
+  by hand in the console, so the infrastructure is reviewed, versioned and
+  reproducible: `sam deploy --config-env prod` builds an identical stack in a
+  different account with one command.
 
 # ---------------------------------------------------------------------------
-# Parameters
+# Parameters — everything that differs between environments
 # ---------------------------------------------------------------------------
-# Everything that changes between environments (dev / staging / prod) lives
-# here so the same template can be replicated across accounts and regions.
+# Any value that changes between dev and prod belongs here, never hard-coded in
+# a resource. This is the mechanism that lets one template produce three
+# environments.
 Parameters:
   Environment:
     Type: String
     Default: dev
     AllowedValues: [dev, staging, prod]
-    Description: Deployment environment. Used to namespace resources and metrics.
+    Description: Deployment environment. Namespaces every resource and metric.
 
   ShortCodeLength:
     Type: Number
     Default: 7
     MinValue: 4
     MaxValue: 16
-    Description: >
-      Number of base62 characters in auto-generated short codes. 7 characters
-      of base62 give 62^7 (~3.5 trillion) unique codes.
+    Description: Base62 characters per generated code. 62^7 ~= 3.5 trillion.
 
   ClickRetentionDays:
     Type: Number
     Default: 90
     MinValue: 1
     MaxValue: 3650
-    Description: >
-      How long individual click events are retained in the analytics table
-      before DynamoDB TTL automatically deletes them.
+    Description: How long raw click events live before TTL deletes them.
 
   MaxCollisionRetries:
     Type: Number
     Default: 5
     MinValue: 1
     MaxValue: 20
-    Description: >
-      How many times short-code generation retries after a collision before
-      giving up and returning an error.
+    Description: Collision retries before create_url gives up with a 503.
 
 # ---------------------------------------------------------------------------
-# Globals — defaults applied to every Serverless::Function in the template
+# Globals — defaults applied to every function in this template
 # ---------------------------------------------------------------------------
 Globals:
   Function:
     Runtime: python3.12
-    Architectures: [arm64]        # Graviton2 — cheaper and faster per request.
-    Timeout: 10
-    MemorySize: 256
-    Tracing: Active               # Enable AWS X-Ray tracing on every function.
+    Architectures: [arm64]   # Graviton: ~20% cheaper and faster than x86 here.
+    Timeout: 10              # Seconds. A redirect takes ~5 ms; this is a
+                             # runaway guard, not a target. Lambda bills by
+                             # duration, so a stuck function on a low timeout
+                             # fails fast and cheap.
+    MemorySize: 256          # Memory also scales CPU. 256 MB is past the knee
+                             # of the curve for this workload — 128 is slower
+                             # enough that it can cost *more* per request.
+    Tracing: Active          # X-Ray distributed tracing.
     Layers:
       - !Ref CommonLayer
     Environment:
       Variables:
+        # This block is the other half of config.py. Every value the code reads
+        # from the environment is injected here, which is what lets the exact
+        # same deployment artifact behave differently per environment.
         URLS_TABLE: !Ref UrlsTable
         CLICKS_TABLE: !Ref ClicksTable
         SHORT_CODE_LENGTH: !Ref ShortCodeLength
@@ -74,43 +76,61 @@ Globals:
         MAX_COLLISION_RETRIES: !Ref MaxCollisionRetries
         METRICS_NAMESPACE: !Sub "URLShortener/${Environment}"
         ENVIRONMENT: !Ref Environment
-        POWERTOOLS_SERVICE_NAME: url-shortener
-        LOG_LEVEL: INFO
   Api:
-    # Turn on CloudWatch access + execution logging and X-Ray for the API.
     TracingEnabled: true
 
-# ---------------------------------------------------------------------------
-# Resources
-# ---------------------------------------------------------------------------
 Resources:
 
   # -------------------------------------------------------------------------
   # Shared Lambda layer
   # -------------------------------------------------------------------------
-  # All four functions share the same helper code (short-code generation,
-  # DynamoDB access, CloudWatch metrics, HTTP response shaping). Packaging it
-  # once as a layer keeps each function's deployment package tiny and avoids
-  # copy-pasting logic between handlers.
+  # A layer is a zip mounted into the function's filesystem at /opt. Because
+  # /opt/python is on sys.path, `from urlshortener_common import ...` just
+  # works. Packaging the shared code once keeps each function's own deployment
+  # package tiny (faster cold starts) and means one fix updates all four.
+  # NOTE: deliberately no `Metadata: BuildMethod: python3.12` here.
+  # That flag tells SAM "this is a Python layer — create a python/ directory
+  # and pip-install requirements.txt into it." But layers/common/ ALREADY has
+  # a python/ directory, so SAM nests it again and you get
+  #     /opt/python/python/urlshortener_common
+  # at runtime, one level below where Lambda looks. The layer has no
+  # third-party dependencies (boto3 ships with the runtime), so there is
+  # nothing to install and SAM should just copy the directory verbatim.
   CommonLayer:
     Type: AWS::Serverless::LayerVersion
-    Metadata:
-      BuildMethod: python3.12
     Properties:
       LayerName: !Sub "url-shortener-common-${Environment}"
       Description: Shared helpers for the URL shortener functions.
       ContentUri: layers/common/
-      CompatibleRuntimes:
-        - python3.12
+      CompatibleRuntimes: [python3.12]
       RetentionPolicy: Delete
 
   # -------------------------------------------------------------------------
-  # DynamoDB — URL mappings
+  # UrlsTable — one row per short link.
   # -------------------------------------------------------------------------
-  # One row per short link. shortCode is the partition key so redirect lookups
-  # are single-digit-millisecond GetItem calls that scale horizontally.
-  # PAY_PER_REQUEST (on-demand) billing means capacity scales automatically
-  # with traffic — no throughput to provision or forecast.
+  # BillingMode: PAY_PER_REQUEST — no capacity is set aside; you pay per
+  #   request. The alternative makes you guess your traffic in advance, and
+  #   guessing low means requests are throttled during exactly the spike
+  #   capacity was meant to absorb. For unpredictable traffic, pay-per-request wins.
+  #
+  # AttributeDefinitions — list ONLY attributes used in a key or an index.
+  #   longUrl and clickCount are deliberately absent; everything outside the
+  #   keys is schemaless. Listing an extra attribute fails the deploy.
+  #
+  # GlobalSecondaryIndexes — a second, automatically-maintained view of the
+  #   same table, keyed by owner instead of code. It is the only reason "list
+  #   my links, newest first" can avoid reading the whole table.
+  #   ProjectionType ALL copies every field into the index, so a lookup needs
+  #   no second trip — extra storage bought in exchange for simpler reads.
+  #   IndexName must EXACTLY match the string in dynamo.list_urls. A test compares the
+  #   two files so a typo fails in CI rather than mid-deploy.
+  #
+  # TimeToLiveSpecification — "when the `ttl` field's time passes, delete this
+  #   row for free." Deletion is eventual though (AWS says within 48 hours),
+  #   which is exactly why dynamo.is_expired ALSO checks on read.
+  #
+  # PointInTimeRecovery — continuous backups; restore to any second in the last
+  #   35 days. The undo button for a bad migration; enable it before it is needed.
   UrlsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -126,8 +146,6 @@ Resources:
       KeySchema:
         - AttributeName: shortCode
           KeyType: HASH
-      # Secondary index that lets us list links for a given owner, newest first,
-      # without scanning the whole table.
       GlobalSecondaryIndexes:
         - IndexName: owner-createdAt-index
           KeySchema:
@@ -137,27 +155,28 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
-      # Optional expiration: when a link has an expiresAt epoch, DynamoDB TTL
-      # deletes the row automatically some time after it lapses. The redirect
-      # handler also enforces expiry on read so behaviour is exact, not eventual.
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Project
-          Value: url-shortener
-        - Key: Environment
-          Value: !Ref Environment
 
   # -------------------------------------------------------------------------
-  # DynamoDB — click events (analytics)
+  # ClicksTable — one row per click.
   # -------------------------------------------------------------------------
-  # One row per click. Partition key is the shortCode, sort key is a
-  # timestamp + unique suffix so all clicks for a link are stored together and
-  # can be range-queried by time. Raw events expire via TTL after
-  # ClickRetentionDays; long-lived aggregate counters live on UrlsTable.
+  # WHAT'S DIFFERENT FROM THE FIRST TABLE
+  #   TWO keys instead of one. HASH (shortCode) decides which machine the row
+  #   lives on; RANGE (clickId) decides the order rows are stored in on that
+  #   machine. So every click for one link sits together, already sorted by
+  #   time.
+  #
+  #   That is the whole reason "give me this link's clicks, newest first" is
+  #   one fast read instead of a search-and-sort. The keys are designed around the
+  #   question the service actually asks.
+  #
+  # NO PointInTimeRecovery here, on purpose. These rows are disposable — they
+  #   delete themselves after 90 days anyway. Pay for durability in proportion
+  #   to what the data is actually worth.
   ClicksTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -176,22 +195,15 @@ Resources:
       TimeToLiveSpecification:
         AttributeName: ttl
         Enabled: true
-      Tags:
-        - Key: Project
-          Value: url-shortener
-        - Key: Environment
-          Value: !Ref Environment
 
   # -------------------------------------------------------------------------
-  # API Gateway (REST) — explicit so we control the stage name and can attach
-  # the CloudWatch dashboard / throttling in one place.
+  # API Gateway
   # -------------------------------------------------------------------------
   Api:
     Type: AWS::Serverless::Api
     Properties:
       Name: !Sub "url-shortener-api-${Environment}"
       StageName: !Ref Environment
-      # Basic protection against abuse. Tune per environment as needed.
       MethodSettings:
         - ResourcePath: "/*"
           HttpMethod: "*"
@@ -204,17 +216,24 @@ Resources:
         AllowOrigin: "'*'"
 
   # -------------------------------------------------------------------------
-  # Lambda functions
+  # Lambda functions — one per endpoint
   # -------------------------------------------------------------------------
-
-  # POST /urls  — create a short link (auto or custom code, optional expiry).
+  # Least privilege is deliberate: the two read-only functions get
+  # DynamoDBReadPolicy rather than Crud, and ListUrlsFunction is not granted
+  # access to ClicksTable at all. If any one function is compromised through a
+  # bug, its blast radius is bounded by what its role permits.
+  #
+  # Routing note: `GET /{shortCode}` is a greedy path at the API root, so
+  # `/urls` could in principle match it. API Gateway prefers literal paths over
+  # variable ones, and shortcode.py additionally refuses to issue reserved
+  # codes — defence in depth on both sides.
   CreateUrlFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "url-shortener-create-${Environment}"
       CodeUri: src/create_url/
-      Handler: app.handler
-      Description: Creates a short link with collision detection and optional TTL.
+      Handler: app.handler          # <module>.<function> inside CodeUri
+      Description: Creates a short link with collision detection.
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UrlsTable
@@ -226,16 +245,15 @@ Resources:
             RestApiId: !Ref Api
             Path: /urls
             Method: post
-
-  # GET /{shortCode}  — resolve a short code and 301-redirect to the target,
-  # recording a click event and emitting CloudWatch metrics along the way.
+  #
+  # Now write the other three:
   RedirectFunction:
     Type: AWS::Serverless::Function
     Properties:
       FunctionName: !Sub "url-shortener-redirect-${Environment}"
       CodeUri: src/redirect/
       Handler: app.handler
-      Description: Resolves a short code, records analytics and redirects.
+      Description: Redirects a short link to its long URL and counts the click.
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref UrlsTable
@@ -249,140 +267,56 @@ Resources:
             RestApiId: !Ref Api
             Path: /{shortCode}
             Method: get
-
-  # GET /urls/{shortCode}/analytics  — aggregated stats for one link.
+  #   RedirectFunction      src/redirect/          GET  /{shortCode}
+  #       Needs Crud on BOTH tables (it reads urls, writes clicks, and
+  #       increments the counter) plus CloudWatchPutMetricPolicy.
   GetAnalyticsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub "url-shortener-analytics-${Environment}"
+      FunctionName: !Sub "url-shortener-get-analytics-${Environment}"
       CodeUri: src/get_analytics/
       Handler: app.handler
-      Description: Returns aggregated click analytics for a short link.
+      Description: Returns analytics for a short link.
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref UrlsTable
         - DynamoDBReadPolicy:
             TableName: !Ref ClicksTable
+        - CloudWatchPutMetricPolicy: {}
       Events:
-        Analytics:
+        GetAnalytics:
           Type: Api
           Properties:
             RestApiId: !Ref Api
             Path: /urls/{shortCode}/analytics
             Method: get
-
-  # GET /urls  — list links (optionally filtered by owner).
+  #   GetAnalyticsFunction  src/get_analytics/     GET  /urls/{shortCode}/analytics
+  #       DynamoDBReadPolicy on both tables. Read, not Crud.
   ListUrlsFunction:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: !Sub "url-shortener-list-${Environment}"
+      FunctionName: !Sub "url-shortener-list-urls-${Environment}"
       CodeUri: src/list_urls/
       Handler: app.handler
-      Description: Lists short links, optionally filtered by owner.
+      Description: Lists all short links owned by the caller.
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref UrlsTable
+        - CloudWatchPutMetricPolicy: {}
       Events:
-        List:
+        ListUrls:
           Type: Api
           Properties:
             RestApiId: !Ref Api
             Path: /urls
             Method: get
-
   # -------------------------------------------------------------------------
-  # CloudWatch dashboard — the "analytics dashboard" for the whole service.
-  # Renders create/redirect volume, latency, errors and per-link click counts
-  # from the custom metrics the functions publish.
+  # Alarm — page when the hot path starts failing
   # -------------------------------------------------------------------------
-  OperationsDashboard:
-    Type: AWS::CloudWatch::Dashboard
-    Properties:
-      DashboardName: !Sub "url-shortener-${Environment}"
-      DashboardBody: !Sub |
-        {
-          "widgets": [
-            {
-              "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
-              "properties": {
-                "markdown": "# URL Shortener — ${Environment}\nLive traffic, latency and click analytics. Custom metrics namespace: `URLShortener/${Environment}`."
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 2, "width": 12, "height": 6,
-              "properties": {
-                "title": "Links created vs. redirects",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "URLShortener/${Environment}", "LinksCreated", { "stat": "Sum", "label": "Links created" } ],
-                  [ "URLShortener/${Environment}", "Redirects",    { "stat": "Sum", "label": "Redirects" } ]
-                ],
-                "period": 300
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 2, "width": 12, "height": 6,
-              "properties": {
-                "title": "Redirect outcomes",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": true,
-                "metrics": [
-                  [ "URLShortener/${Environment}", "RedirectHit",     { "stat": "Sum", "label": "Hit (200/301)" } ],
-                  [ "URLShortener/${Environment}", "RedirectNotFound",{ "stat": "Sum", "label": "Not found (404)" } ],
-                  [ "URLShortener/${Environment}", "RedirectExpired", { "stat": "Sum", "label": "Expired (410)" } ]
-                ],
-                "period": 300
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 8, "width": 12, "height": 6,
-              "properties": {
-                "title": "Lambda duration (p50 / p99)",
-                "region": "${AWS::Region}",
-                "view": "timeSeries",
-                "metrics": [
-                  [ "AWS/Lambda", "Duration", "FunctionName", "url-shortener-redirect-${Environment}", { "stat": "p50", "label": "redirect p50" } ],
-                  [ "...", { "stat": "p99", "label": "redirect p99" } ],
-                  [ "AWS/Lambda", "Duration", "FunctionName", "url-shortener-create-${Environment}", { "stat": "p99", "label": "create p99" } ]
-                ],
-                "period": 300
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 8, "width": 12, "height": 6,
-              "properties": {
-                "title": "Errors & collisions",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": false,
-                "metrics": [
-                  [ "URLShortener/${Environment}", "ShortCodeCollision", { "stat": "Sum", "label": "Code collisions" } ],
-                  [ "AWS/Lambda", "Errors", "FunctionName", "url-shortener-create-${Environment}", { "stat": "Sum", "label": "create errors" } ],
-                  [ "AWS/Lambda", "Errors", "FunctionName", "url-shortener-redirect-${Environment}", { "stat": "Sum", "label": "redirect errors" } ]
-                ],
-                "period": 300
-              }
-            },
-            {
-              "type": "metric", "x": 0, "y": 14, "width": 24, "height": 6,
-              "properties": {
-                "title": "Clicks by country (top dimensions)",
-                "region": "${AWS::Region}",
-                "view": "timeSeries", "stacked": true,
-                "metrics": [
-                  [ "URLShortener/${Environment}", "ClicksByCountry", "Country", "US", { "stat": "Sum" } ],
-                  [ "...", "Country", "GB", { "stat": "Sum" } ],
-                  [ "...", "Country", "DE", { "stat": "Sum" } ],
-                  [ "...", "Country", "IN", { "stat": "Sum" } ],
-                  [ "...", "Country", "UNKNOWN", { "stat": "Sum" } ]
-                ],
-                "period": 3600
-              }
-            }
-          ]
-        }
-
-  # A representative alarm: page when redirects start throwing errors.
+  # TreatMissingData: notBreaching is the setting that matters. A shortener
+  # with no traffic emits no Errors datapoints at all, and CloudWatch's default
+  # treats missing data as breaching — so a quiet weekend would page. Alarms
+  # that cry wolf get muted, and a muted alarm is worse than no alarm.
   RedirectErrorAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -399,20 +333,21 @@ Resources:
       Threshold: 5
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+  #
+  # That last line is the one people get wrong. A URL shortener with no traffic
 
 # ---------------------------------------------------------------------------
-# Outputs — printed after every deploy and importable by other stacks.
+# Outputs — printed after every deploy
 # ---------------------------------------------------------------------------
+# The values needed immediately after a deploy, so nothing has to be looked
+# up in the console.
 Outputs:
   ApiBaseUrl:
-    Description: Base URL of the deployed API. Short links look like {ApiBaseUrl}/{code}.
+    Description: Base URL of the API. Short links are {ApiBaseUrl}/{code}.
     Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
   CreateUrlEndpoint:
     Description: POST here to create a short link.
     Value: !Sub "https://${Api}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/urls"
-  DashboardUrl:
-    Description: CloudWatch dashboard with live analytics.
-    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=url-shortener-${Environment}"
   UrlsTableName:
     Description: DynamoDB table storing URL mappings.
     Value: !Ref UrlsTable

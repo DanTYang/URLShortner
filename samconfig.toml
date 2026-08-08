@@ -11,19 +11,28 @@ version = 0.1
 # ---------------------------------------------------------------------------
 [default.global.parameters]
 stack_name = "url-shortener-dev"
+region = "us-east-1"
 
 [default.build.parameters]
 cached = true
 parallel = true
 
 [default.deploy.parameters]
-stack_name = "url-shortener-dev"
 resolve_s3 = true                 # let SAM manage the deployment artifact bucket
 s3_prefix = "url-shortener-dev"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"   # the stack creates scoped IAM roles
 confirm_changeset = true
+image_repositories = []
+# Only override what actually differs from the template's defaults.
+# ShortCodeLength, ClickRetentionDays and MaxCollisionRetries all have sensible
+# Defaults in template.yaml, so listing them here would just be a second place
+# to keep in sync.
 parameter_overrides = "Environment=dev"
+# Roll back on failure. With this true, a failed deploy leaves the stack stuck
+# in an UPDATE_FAILED state that blocks every later deploy until you delete it
+# by hand. Only flip it when you specifically want to inspect a broken stack.
+disable_rollback = false
 
 # ---------------------------------------------------------------------------
 [staging.deploy.parameters]
