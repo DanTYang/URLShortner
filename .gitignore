@@ -1,3 +1,11 @@
+# --- Local-only, not published ---------------------------------------------
+# The test suite and its harness are kept locally but deliberately not pushed.
+tests/
+pytest.ini
+# Working copy and course scaffolding from an earlier iteration of this project.
+starter/
+ASSIGNMENT.md
+
 # --- AWS SAM build / deploy artifacts ---
 .aws-sam/
 samconfig.local.toml

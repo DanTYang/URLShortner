@@ -1,7 +1,7 @@
 # Convenience wrapper around the common workflows. Run `make help` for a list.
 #
-# The real work is done by the AWS SAM CLI and pytest; these targets just
-# capture the exact invocations so you never have to remember the flags.
+# The real work is done by the AWS SAM CLI; these targets just capture the
+# exact invocations.
 
 .DEFAULT_GOAL := help
 ENV ?= dev
@@ -10,14 +10,6 @@ ENV ?= dev
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
-
-.PHONY: install
-install: ## Install test/dev dependencies
-	python3 -m pip install -r tests/requirements.txt
-
-.PHONY: test
-test: ## Run the unit test suite (offline, mocked AWS)
-	python3 -m pytest
 
 .PHONY: build
 build: ## Build all functions & layers with SAM
