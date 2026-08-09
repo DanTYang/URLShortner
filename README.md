@@ -185,15 +185,39 @@ but not traffic from distinct visitors.
 Approximate order of magnitude in `us-east-1`: one million redirects costs a few
 dollars, dominated by API Gateway request pricing.
 
+## Roadmap
+
+Planned work, in dependency order.
+
+**User accounts via Google.** A Cognito user pool federating to Google, with a
+Cognito authorizer on the three non-redirect routes. `owner` is then read from
+the verified token rather than the request body, which turns it from a grouping
+label into an access control. The redirect endpoint stays public. Listing
+becomes scoped to the authenticated caller and the unfiltered scan path is
+removed.
+
+**Per-user link quota.** A cap of 50 to 100 simultaneously live links per user,
+counted at creation time by querying the owner index and filtering out expired
+rows. Returns `429` with the current usage when the cap is reached.
+
+**Link deletion.** `DELETE /urls/{shortCode}` using a conditional delete so a
+caller can only remove their own links. Frees a quota slot immediately.
+
+**Hour-granularity lifetimes.** `expiresInHours` from 1 to 168, replacing the
+current day-granularity field and capping link lifetime at seven days.
+
+**Destination screening.** Checking submitted URLs against a malicious-URL list
+such as Google Safe Browsing before shortening. A shortener domain that lands on
+a phishing blocklist breaks every link it has ever issued, so this protects the
+one thing that cannot be recovered.
+
+**CloudFront distribution.** Fronting the API would supply real
+`CloudFront-Viewer-Country` values, and a shared edge cache would absorb repeat
+traffic from distinct visitors rather than only from the same browser.
+
 ## Limitations
 
-The following are known and unaddressed in the current scope.
-
-**No authentication.** The redirect endpoint is intentionally public. The other
-three are not protected, and `owner` is a client-supplied string, so it groups
-links rather than restricting access to them. API Gateway API keys would be the
-minimum fix; a Cognito authorizer reading the owner from a verified token is the
-correct one.
+Known and accepted in the current scope.
 
 **Synchronous click recording.** Each redirect performs one read and two writes,
 tripling DynamoDB operations on the highest-traffic endpoint. Moving the write
@@ -203,13 +227,9 @@ off the request path via DynamoDB Streams or SQS would remove that cost.
 click events per request and reports `truncated` when that bound is reached.
 Precomputed daily rollups would remove the bound.
 
-**Geography depends on CloudFront.** Country is read from the
+**Geography degrades without CloudFront.** Country is read from the
 `CloudFront-Viewer-Country` header. Behind a bare API Gateway URL the value
-degrades to `UNKNOWN`.
-
-**No destination screening.** Submitted URLs are validated for scheme and
-length but not checked against a malicious-URL list. A shortener domain that
-lands on a phishing blocklist breaks every link it has issued.
+falls back to `UNKNOWN`.
 
 ## License
 
