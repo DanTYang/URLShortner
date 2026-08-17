@@ -70,7 +70,7 @@ Client ──► API Gateway ──► RedirectFunction
                               │      • atomic increment clickCount
                               │      • emit ClicksByCountry / ClicksByReferrer
                               ▼
-                         301 Location: <longUrl>   (Cache-Control: 1 day)
+                         302 Location: <longUrl>   (Cache-Control: <=60s)
 ```
 Analytics is wrapped in try/except so **a failure to record a click never
 breaks a redirect** — resolving the link is the user's actual goal.
@@ -170,12 +170,21 @@ referrer, day) are computed from raw click events that expire after the
 retention window. You keep long-term totals forever without paying to store
 every raw event forever.
 
-### 6. 301 (permanent) redirects
-A `301` with `Cache-Control` lets browsers, crawlers, and CDNs cache the
-mapping, so a viral link's repeat traffic is served without ever invoking
-Lambda. The trade-off: you can't change a link's destination after clients
-cache it — acceptable for a shortener, where a code maps to one URL for life.
-(Switch to `302` in `responses.redirect` if you need mutable destinations.)
+### 6. Briefly-cached `302` redirects
+Redirects return `302` with a `Cache-Control` window of at most 60 seconds,
+capped at the link's remaining lifetime. A cached response cannot be revoked,
+so that window is the worst case for how long a deleted or expired link keeps
+resolving.
+
+`301` would permit longer caching and fewer invocations, but it asserts
+permanence and some intermediaries cache it indefinitely regardless of
+`Cache-Control`. Since every link can expire, that assertion would be false.
+
+The cost of the short window is small: browser caches are per-client, so a
+thousand visitors clicking one link produce a thousand cache misses at any
+`max-age`. Only repeat clicks from the same browser are ever absorbed. A CDN in
+front would change this, since a shared cache serves every visitor from one
+fetch.
 
 ---
 
@@ -196,8 +205,8 @@ cache it — acceptable for a shortener, where a code maps to one URL for life.
 - API Gateway REST: ~$3.50 per million requests.
 
 So ~1M redirects ≈ a few dollars, and **idle cost is essentially $0** because
-nothing is provisioned. Caching 301s further cuts the Lambda/DynamoDB share of
-repeat traffic.
+nothing is provisioned. The short redirect cache absorbs repeat clicks from the
+same browser but not traffic from distinct visitors.
 
 ---
 
@@ -230,6 +239,6 @@ screening. These are called out as next steps in [`DEVELOPMENT.md`](DEVELOPMENT.
 | Can't find a free code after N retries | `503` asking the client to retry (astronomically unlikely). |
 | Unknown short code | `404 Not found`. |
 | Expired link | `410 Gone` (exact check on read; TTL cleans up later). |
-| Analytics write fails on redirect | Swallowed and logged; the `301` still succeeds. |
+| Analytics write fails on redirect | Swallowed and logged; the `302` still succeeds. |
 | Invalid input | `400` with a specific message (bad URL, bad custom code, bad expiry). |
 | Redirect function erroring | CloudWatch alarm `url-shortener-redirect-errors-*` fires at ≥5 errors / 5 min. |

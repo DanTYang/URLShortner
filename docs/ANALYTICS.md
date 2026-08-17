@@ -120,7 +120,7 @@ All under namespace `URLShortener/<env>`:
 |---|---|---|
 | `LinksCreated` | — | A link is created. |
 | `Redirects` | — | Any successful redirect. |
-| `RedirectHit` | — | A redirect resolved to a target (200/301). |
+| `RedirectHit` | — | A redirect resolved to a target (302). |
 | `RedirectNotFound` | — | Redirect for an unknown code (404). |
 | `RedirectExpired` | — | Redirect for an expired link (410). |
 | `ClicksByCountry` | `Country` | Per successful redirect, sliced by country. |

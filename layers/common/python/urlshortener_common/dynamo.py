@@ -135,9 +135,9 @@ def list_urls(owner=None, *, limit=50):
 def is_expired(url_row, *, now=None):
     """True if the link carries an ``expiresAt`` in the past.
 
-    ``now`` is injectable so tests can simulate the future without sleeping.
-    Compared with ``is None`` rather than truthiness, because epoch 0 is a
-    legitimate instant.
+    ``now`` is injectable so a caller can evaluate expiry against an arbitrary
+    instant rather than the wall clock. Compared with ``is None`` rather than
+    truthiness, because epoch 0 is a legitimate instant.
     """
     expires_at = url_row.get("expiresAt")
     if expires_at is None:

@@ -122,8 +122,8 @@ Resources:
   #   my links, newest first" can avoid reading the whole table.
   #   ProjectionType ALL copies every field into the index, so a lookup needs
   #   no second trip — extra storage bought in exchange for simpler reads.
-  #   IndexName must EXACTLY match the string in dynamo.list_urls. A test compares the
-  #   two files so a typo fails in CI rather than mid-deploy.
+  #   IndexName must EXACTLY match the string in dynamo.list_urls; a mismatch
+  #   fails every owner-filtered listing at runtime.
   #
   # TimeToLiveSpecification — "when the `ttl` field's time passes, delete this
   #   row for free." Deletion is eventual though (AWS says within 48 hours),
@@ -164,8 +164,8 @@ Resources:
   # -------------------------------------------------------------------------
   # ClicksTable — one row per click.
   # -------------------------------------------------------------------------
-  # WHAT'S DIFFERENT FROM THE FIRST TABLE
-  #   TWO keys instead of one. HASH (shortCode) decides which machine the row
+  # A composite key, unlike UrlsTable.
+  #   HASH (shortCode) decides which machine the row
   #   lives on; RANGE (clickId) decides the order rows are stored in on that
   #   machine. So every click for one link sits together, already sorted by
   #   time.
@@ -245,8 +245,7 @@ Resources:
             RestApiId: !Ref Api
             Path: /urls
             Method: post
-  #
-  # Now write the other three:
+
   RedirectFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -267,9 +266,7 @@ Resources:
             RestApiId: !Ref Api
             Path: /{shortCode}
             Method: get
-  #   RedirectFunction      src/redirect/          GET  /{shortCode}
-  #       Needs Crud on BOTH tables (it reads urls, writes clicks, and
-  #       increments the counter) plus CloudWatchPutMetricPolicy.
+
   GetAnalyticsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -290,8 +287,7 @@ Resources:
             RestApiId: !Ref Api
             Path: /urls/{shortCode}/analytics
             Method: get
-  #   GetAnalyticsFunction  src/get_analytics/     GET  /urls/{shortCode}/analytics
-  #       DynamoDBReadPolicy on both tables. Read, not Crud.
+
   ListUrlsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -310,6 +306,7 @@ Resources:
             RestApiId: !Ref Api
             Path: /urls
             Method: get
+
   # -------------------------------------------------------------------------
   # Alarm — page when the hot path starts failing
   # -------------------------------------------------------------------------

@@ -68,9 +68,9 @@ def generate_unique_code(try_claim, *, length=None, max_retries=None):
     try_claim:
         Callback invoked with a candidate code. Must return True if the code
         was atomically reserved and False if it already existed. In production
-        this is a DynamoDB conditional write; in tests it is a fake. This
-        module neither knows nor cares which — that separation is what lets the
-        real uniqueness guarantee live in the storage engine.
+        this is a DynamoDB conditional write. This module neither knows nor
+        cares what backs it, which is what lets the real uniqueness guarantee
+        live in the storage engine rather than here.
     length:
         Starting code length. Defaults to ``config.SHORT_CODE_LENGTH``.
     max_retries:

@@ -73,10 +73,11 @@ candidate. Click counters use an atomic `UpdateExpression` for the same reason.
 
 ### Short codes are drawn from a CSPRNG
 
-Sequential identifiers encoded to base62 are dense and enumerable. A short link
-is a bearer token, since knowing the code is sufficient to follow it, so codes
-come from `secrets` over a 62-symbol alphabet. Seven characters give roughly
-3.5 trillion combinations. Sustained collisions widen the code by one character.
+Codes are randomly generated base62 strings, not encoded counters. Sequential
+identifiers are dense and enumerable, and a short link is a bearer token since
+knowing the code is sufficient to follow it. Codes are drawn from `secrets`, a
+CSPRNG, over a 62-symbol alphabet. Seven characters give roughly 3.5 trillion
+combinations, and sustained collisions widen the code by one character.
 
 ### Metrics are emitted through the log stream
 
@@ -95,7 +96,8 @@ than the redirect. The trade-off is documented at the call site.
 
 Redirects return `302` with a one-minute `Cache-Control` window, capped at the
 link's remaining lifetime. A cached response cannot be revoked, so that window
-is the worst case for how long a deleted or expired link keeps resolving.
+is the worst case for how long an expired link keeps resolving, and the same
+bound will apply to deletion once that endpoint exists.
 
 `301` would allow longer caching and fewer invocations, but it asserts
 permanence, and some intermediaries cache a `301` indefinitely regardless of
@@ -115,11 +117,14 @@ indefinitely. Country, referrer and daily breakdowns are computed from raw
 click events, which expire after 90 days via DynamoDB TTL. Long-term totals are
 retained without storing every raw event permanently.
 
-### IAM follows least privilege
+### Permissions are scoped per function
 
+Each function declares its own SAM policy templates, which expand into an IAM
+role scoped to the named tables rather than a shared role or a wildcard policy.
 The two read-only functions receive `DynamoDBReadPolicy` rather than
-`DynamoDBCrudPolicy`. `ListUrlsFunction` has no access to the clicks table at
-all. A fault in any one function is bounded by the permissions of its own role.
+`DynamoDBCrudPolicy`, and `ListUrlsFunction` has no access to the clicks table
+at all. A fault in any one function is bounded by the permissions of its own
+role.
 
 ## Deploying
 

@@ -6,7 +6,7 @@ real shortener, so everything here runs at production volume.
     1. one GetItem to resolve the code
     2. 404 if unknown, 410 if expired
     3. record the click (best effort)
-    4. 301 with a cacheable Location header
+    4. 302 with a short, bounded Cache-Control window
 
 Analytics is deliberately best-effort. Resolving the link is the user's goal;
 recording the click is ours. If the write fails we serve the redirect anyway
@@ -36,17 +36,16 @@ _MAX_CACHE_SECONDS = 60
 
 
 def handler(event, context):
-    """Resolve ``shortCode`` and issue a 301 to its target URL.
+    """Resolve ``shortCode`` and issue a 302 to its target URL.
 
     Returns 400 if the code is missing, 404 if unknown, 410 if expired.
 
     404 versus 410 is deliberate: 410 Gone tells crawlers the resource existed
     and was removed, which de-indexes faster than a bare 404.
 
-    301 rather than 302 lets browsers and CDNs cache the mapping, so repeat
-    traffic to a popular link never reaches Lambda. The trade-off is that a
-    cached redirect cannot be changed — acceptable where a code maps to one URL
-    for life.
+    302 rather than 301 because a cached redirect cannot be revoked and every
+    link here can be deleted or expire. The cache window is capped at the link's
+    remaining lifetime and never exceeds ``_MAX_CACHE_SECONDS``.
     """
     # pathParameters is None, not {}, when API Gateway has none to send.
     short_code = (event.get("pathParameters") or {}).get("shortCode", "")
